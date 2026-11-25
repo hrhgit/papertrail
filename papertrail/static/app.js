@@ -65,7 +65,6 @@ const state = {
   folded: new Set(),
   agentOnly: false,
   file: null,
-  byLine: [],
   line: null,
   // Deletions by the number of lines above them, newest first at each spot.
   gapsAt: new Map(),
@@ -434,40 +433,69 @@ function fileTree(entries) {
     }
     node.files.push(e);
   }
-  return top;
+  const sorted = (node) => ({
+    files: node.files.sort((a, b) => base(a.path).localeCompare(base(b.path))),
+    dirs: [...node.dirs.values()].sort((a, b) => a.name.localeCompare(b.name)).map((dir) => {
+      let label = dir.name;
+      // Compact single-child chains like an editor does: src/app/lib.
+      while (!dir.files.length && dir.dirs.size === 1) {
+        dir = dir.dirs.values().next().value;
+        label += "/" + dir.name;
+      }
+      return { ...sorted(dir), label, path: dir.path, agent: dir.agent };
+    }),
+  });
+  return sorted(top);
 }
+
+let filesView = null;
 
 function ensureExpanded(path) {
   if (!inRoot(path)) return;
+  const view = filesView?.active;
   const parts = rel(path).split("/").slice(0, -1);
   let acc = "";
   for (const part of parts) {
     state.expanded.add((acc += part + "/"));
     state.folded.delete(acc);
+    const folder = view?.folders.get(acc);
+    if (folder) setTreeFolder(view, folder, true);
   }
+  updateFoldButton();
 }
 
 const folderOpen = (path) => (state.agentOnly ? !state.folded.has(path) : state.expanded.has(path));
 
-function toggleFolder(path) {
+function toggleFolder(view, folder) {
+  const path = folder.dir.path;
   const set = state.agentOnly ? state.folded : state.expanded;
   if (set.has(path)) set.delete(path);
   else set.add(path);
-  renderFiles();
+  setTreeFolder(view, folder, folderOpen(path));
+  updateFoldButton();
 }
 
-function foldAll(tree) {
+function foldAll() {
+  const view = filesView.active;
   state.expanded.clear();
   if (state.agentOnly) {
     const walk = (node) => {
-      for (const d of node.dirs.values()) {
-        state.folded.add(d.path);
-        walk(d);
+      for (const dir of node.dirs) {
+        state.folded.add(dir.path);
+        walk(dir);
       }
     };
-    walk(tree);
+    walk(view.tree);
   }
-  renderFiles();
+  for (const folder of view.folders.values()) setTreeFolder(view, folder, false);
+  updateFoldButton();
+}
+
+function updateFoldButton() {
+  if (!filesView?.active) return;
+  const view = filesView.active;
+  filesView.fold.disabled = !view.tree.dirs.some((dir) => folderOpen(dir.path));
+  filesView.fold.hidden = !view.tree.dirs.length && !view.tree.files.length;
 }
 
 function fileRow(e, depth, label = base(e.path)) {
@@ -484,7 +512,7 @@ function fileRow(e, depth, label = base(e.path)) {
       class: agentWrote(e) ? "item tree-row" : "item tree-row plain",
       style: `--depth:${depth}`,
       "data-path": e.path,
-      "aria-current": state.file?.path === e.path ? "true" : "false",
+      "aria-current": "false",
       title: tip,
       onclick: () => openFile(e.path),
     },
@@ -493,67 +521,126 @@ function fileRow(e, depth, label = base(e.path)) {
   );
 }
 
-function treeRows(node, depth, out) {
-  const dirs = [...node.dirs.values()].sort((a, b) => a.name.localeCompare(b.name));
-  for (let d of dirs) {
-    // Compact single-child chains like an editor does: src/app/lib.
-    let label = d.name;
-    while (!d.files.length && d.dirs.size === 1) {
-      d = [...d.dirs.values()][0];
-      label += "/" + d.name;
-    }
-    const open = folderOpen(d.path);
-    const folder = d;
-    out.push(
-      h(
-        "button",
-        {
-          type: "button",
-          class: folder.agent ? "item tree-row dir" : "item tree-row dir plain",
-          style: `--depth:${depth}`,
-          "aria-expanded": String(open),
-          title: folder.agent ? `${plural(folder.agent, "file")} edited by agents` : null,
-          onclick: () => toggleFolder(folder.path),
-        },
-        h("span", { class: "chev", "aria-hidden": "true" }),
-        h("span", { class: "name" }, label),
-      ),
-    );
-    if (open) treeRows(d, depth + 1, out);
+function setTreeFolder(view, folder, open) {
+  if (folder.branch.hidden === !open) return;
+  folder.button.setAttribute("aria-expanded", String(open));
+  folder.branch.hidden = !open;
+  if (open && !folder.filled) {
+    folder.filled = true;
+    treeRows(view, folder.dir, folder.depth + 1, folder.branch);
   }
-  for (const e of node.files.sort((a, b) => base(a.path).localeCompare(base(b.path)))) out.push(fileRow(e, depth));
+}
+
+function treeRows(view, node, depth, out) {
+  for (const dir of node.dirs) {
+    const branch = h("div", { hidden: true });
+    const folder = { dir, branch, depth, filled: false };
+    folder.button = h(
+      "button",
+      {
+        type: "button",
+        class: dir.agent ? "item tree-row dir" : "item tree-row dir plain",
+        style: `--depth:${depth}`,
+        "aria-expanded": "false",
+        title: dir.agent ? `${plural(dir.agent, "file")} edited by agents` : null,
+        onclick: () => toggleFolder(view, folder),
+      },
+      h("span", { class: "chev", "aria-hidden": "true" }),
+      h("span", { class: "name" }, dir.label),
+    );
+    view.folders.set(dir.path, folder);
+    out.append(folder.button, branch);
+    setTreeFolder(view, folder, folderOpen(dir.path));
+  }
+  for (const e of node.files) {
+    const row = fileRow(e, depth);
+    view.files.set(e.path, row);
+    out.append(row);
+  }
+}
+
+function markFileRow(scroll = false) {
+  if (!filesView?.active) return;
+  const view = filesView.active;
+  const path = state.file?.path;
+  const row = view.files.get(path) || filesView.awayRows.get(path);
+  const mark = (el, selected) => {
+    el.classList.toggle("file-current", selected);
+    el.setAttribute("aria-current", String(selected));
+  };
+  for (const old of [view.selected, filesView.awaySelected]) if (old && old !== row) mark(old, false);
+  view.selected = view.files.get(path);
+  filesView.awaySelected = filesView.awayRows.get(path);
+  if (!row) return;
+  mark(row, true);
+  if (scroll && filesView.awaySelected) filesView.away.open = true;
+  if (scroll) row.scrollIntoView({ block: "nearest" });
+}
+
+function showFileTree() {
+  const { views, here, body } = filesView;
+  const only = state.agentOnly;
+  let view = views.get(only);
+  if (!view) {
+    const tree = fileTree(only ? here.filter(agentWrote) : here);
+    const rows = h("div");
+    view = { tree, rows, files: new Map(), folders: new Map() };
+    views.set(only, view);
+    treeRows(view, tree, 0, rows);
+    if (!rows.childElementCount) rows.append(h("p", { class: "none" }, only ? "No agent-edited files" : "Empty folder"));
+    body.append(rows);
+  } else {
+    for (const [path, folder] of view.folders) setTreeFolder(view, folder, folderOpen(path));
+  }
+  if (filesView.active && filesView.active !== view) filesView.active.rows.hidden = true;
+  view.rows.hidden = false;
+  filesView.active = view;
+  filesView.filter.setAttribute("aria-pressed", String(only));
+  updateFoldButton();
+  markFileRow();
 }
 
 function renderFiles() {
   const box = $("tab-files");
-  if (!state.root) return renderNoFolder(box);
+  if (!state.root) {
+    filesView = null;
+    return renderNoFolder(box);
+  }
   const scroll = box.scrollTop;
-  const here = state.entries.filter((e) => inRoot(e.path) && (!state.agentOnly || agentWrote(e)));
-  const away = state.entries.filter((e) => !inRoot(e.path));
+  if (filesView?.entries !== state.entries || filesView.root !== state.root) {
+    const here = [], away = [];
+    for (const entry of state.entries) (inRoot(entry.path) ? here : away).push(entry);
+    const awayRows = new Map(away.map((entry) => [entry.path, fileRow(entry, 0, rel(entry.path))]));
+    const outside = awayRows.size ? h(
+      "details",
+      { class: "past", open: awayRows.has(state.file?.path) },
+      h("summary", { title: "Edited by the same sessions" }, "Outside this folder", h("span", { class: "count" }, awayRows.size)),
+    ) : null;
+    if (outside) for (const row of awayRows.values()) outside.append(row);
+    filesView = {
+      here, awayRows, away: outside, views: new Map(), active: null,
+      entries: state.entries, root: state.root, body: h("div"),
+    };
+  }
   const name = base(state.root.replace(/\/$/, "")) || state.root || "Files";
-  const filter = h(
+  filesView.filter = h(
     "button",
     {
       type: "button",
       class: "icon-btn",
-      "aria-pressed": String(state.agentOnly),
       "aria-label": "Agent-edited files only",
       title: "Agent-edited files only",
       onclick: () => {
         state.agentOnly = !state.agentOnly;
         store("papertrail-agent-only", state.agentOnly);
-        renderFiles();
+        showFileTree();
       },
     },
     icon("sparkle"),
   );
-  const rows = [];
-  const tree = fileTree(here);
-  treeRows(tree, 0, rows);
-  const anyOpen = rows.some((r) => r.classList?.contains("dir") && r.getAttribute("aria-expanded") === "true");
-  const fold = h(
+  filesView.fold = h(
     "button",
-    { type: "button", class: "icon-btn", "aria-label": "Collapse folders", title: "Collapse folders", disabled: !anyOpen, onclick: () => foldAll(tree) },
+    { type: "button", class: "icon-btn", "aria-label": "Collapse folders", title: "Collapse folders", onclick: foldAll },
     icon("fold"),
   );
   box.replaceChildren(
@@ -562,8 +649,8 @@ function renderFiles() {
         "div",
         { class: "explorer-head" },
         h("button", { type: "button", class: "folder-name", title: `${state.root}\nOpen another folder (${MOD}O)`, onclick: pickFolder }, name),
-        rows.length ? fold : null,
-        state.overview ? filter : null,
+        filesView.fold,
+        state.overview ? filesView.filter : null,
       ),
       state.overview
         ? null
@@ -580,18 +667,12 @@ function renderFiles() {
               h("p", {}, "No history yet"),
               h("button", { type: "button", class: "primary", onclick: () => buildHistory() }, "Build History"),
             ),
-      ...(rows.length ? rows : [h("p", { class: "none" }, state.agentOnly ? "No agent-edited files" : "Empty folder")]),
+      filesView.body,
       state.tree?.truncated ? h("p", { class: "none" }, `First ${state.tree.files.length} files shown`) : null,
-      away.length
-        ? h(
-            "details",
-            { class: "past", open: away.some((e) => e.path === state.file?.path) },
-            h("summary", { title: "Edited by the same sessions" }, "Outside this folder", h("span", { class: "count" }, away.length)),
-            away.map((e) => fileRow(e, 0, rel(e.path))),
-          )
-        : null,
+      filesView.away,
     ].filter(Boolean),
   );
+  showFileTree();
   box.scrollTop = scroll;
 }
 
@@ -719,6 +800,11 @@ function renderSessions() {
 function selectTab(name) {
   for (const b of document.querySelectorAll(".tabs button")) b.setAttribute("aria-selected", String(b.dataset.tab === name));
   for (const t of ["files", "crossings", "sessions", "outline", "search"]) $("tab-" + t).hidden = t !== name;
+  if (name === "outline") renderOutline();
+  else {
+    cancelOutline?.();
+    cancelOutline = null;
+  }
 }
 
 /* ---------- Search ---------- */
@@ -1081,26 +1167,37 @@ function braceOutline(lines, tokens, lang) {
   return items;
 }
 
-function syntaxTokens(file) {
-  if (!file.lines || file.lines.length > MAX_SYNTAX_LINES) return null;
-  if (file.tokens === undefined) file.tokens = SYNTAX.tokens(file.lines, file.path);
-  return file.tokens;
+function markdownOutline(lines) {
+  const scan = SYNTAX.scanner("markdown");
+  const items = [];
+  const open = [];
+  let last = 0;
+  for (const [i, text] of lines.entries()) {
+    const heading = scan(text)[0]?.[2] === "keyword" && /^(#{1,6})\s+(.*)/.exec(text);
+    if (heading) {
+      const indent = heading[1].length;
+      while (open.length && open.at(-1).indent >= indent) open.pop().end = last;
+      const item = { line: i + 1, name: heading[2].trim(), kind: "", indent, depth: open.length };
+      items.push(item);
+      open.push(item);
+    }
+    if (text.trim()) last = i + 1;
+  }
+  for (const item of open) item.end = last;
+  return items;
 }
 
-function outlineOf(file) {
+function outlineOf(file, tokens) {
   const lines = file?.lines;
-  const tokens = lines && syntaxTokens(file);
-  if (!tokens) return [];
+  if (!lines) return [];
   const lang = SYNTAX.language(file.path, lines[0]);
+  if (!lang) return [];
+  const headings = lang === "markdown";
+  if (!headings) tokens ??= SYNTAX.tokens(lines, file.path);
   const braces = lang === "javascript" || lang === "go" || (lang === "java" && /\.java$/i.test(file.path));
   const extra = ["c", "java", "csharp", "php"].includes(lang) ? [TYPED] : [];
-  const items = braces ? braceOutline(lines, tokens, lang) : [];
-  if (!braces) lines.forEach((text, i) => {
-    if (lang === "markdown") {
-      const m = tokens[i][0]?.[2] === "keyword" && /^(#{1,6})\s+(.*)/.exec(text);
-      if (m) items.push({ line: i + 1, name: m[2].trim(), kind: "", indent: m[1].length, heading: true });
-      return;
-    }
+  const items = headings ? markdownOutline(lines) : braces ? braceOutline(lines, tokens, lang) : [];
+  if (!headings && !braces) lines.forEach((text, i) => {
     const def = tokens[i].find((t) => t[2] === "def");
     if (def) {
       const kind = /([\w$]+)\W*$/.exec(text.slice(0, def[0]))?.[1] || "";
@@ -1116,37 +1213,34 @@ function outlineOf(file) {
     }
   });
   const open = [];
-  items.forEach((item, k) => {
-    while (open.length && (braces ? open.at(-1).end < item.line : open.at(-1).indent >= item.indent)) open.pop();
-    item.depth = open.length;
-    open.push(item);
+  const tracks = file.tracks || [];
+  items.forEach((item) => {
+    if (!headings) {
+      while (open.length && (braces ? open.at(-1).end < item.line : open.at(-1).indent >= item.indent)) open.pop();
+      item.depth = open.length;
+      open.push(item);
+    }
     // The body runs while lines stay indented deeper, through its closing bracket.
-    let end = item.line;
-    if (braces) {
-      end = item.end;
-    } else if (item.heading) {
-      const next = items.slice(k + 1).find((other) => other.indent <= item.indent);
-      end = next ? next.line - 1 : lines.length;
-      while (end > item.line && !lines[end - 1].trim()) end--;
-    } else {
+    if (!braces && !headings) {
+      item.end = item.line;
       for (let n = item.line + 1; n <= lines.length; n++) {
         const text = lines[n - 1];
         if (!text.trim()) continue;
         if (indentOf(text) <= item.indent && !/^\s*(?:[)\]}]|end\b)/.test(text)) break;
-        end = n;
+        item.end = n;
       }
     }
-    item.end = end;
-    // Who owns its lines now, most lines first, then who wrote there before.
+    // Count intersections with the ownership ranges without visiting every line.
     const owned = new Map();
     const kinds = new Map();
     const past = new Set();
-    for (let n = item.line; n <= end; n++) {
-      const range = state.byLine[n];
-      if (!range) continue;
+    const first = lowerBound(tracks.length, (i) => tracks[i].end < item.line);
+    for (let i = first; i < tracks.length && tracks[i].start <= item.end; i++) {
+      const range = tracks[i];
+      const size = Math.min(item.end, range.end) - Math.max(item.line, range.start) + 1;
       const ids = laneIds(range);
-      if (range.kind === "agent" && ids.length) owned.set(ids[0], (owned.get(ids[0]) || 0) + 1);
-      else kinds.set(range.kind, (kinds.get(range.kind) || 0) + 1);
+      if (range.kind === "agent" && ids.length) owned.set(ids[0], (owned.get(ids[0]) || 0) + size);
+      else kinds.set(range.kind, (kinds.get(range.kind) || 0) + size);
       for (const id of ids) past.add(id);
     }
     item.owners = [...owned].sort((a, b) => b[1] - a[1]);
@@ -1185,26 +1279,79 @@ function outlineRow(item) {
   );
 }
 
+const outlineView = { file: undefined, focus: null, rows: [] };
+const outlines = new Map();
+
+// The endpoint has no revision identifier. Compare the source and the ownership
+// fields the outline actually uses before sharing a result across file opens.
+function cachedOutline(file) {
+  const cached = outlines.get(file.path);
+  if (!cached || file.lines.length !== cached.lines.length || file.tracks.length !== cached.tracks.length) return null;
+  if (!file.tracks.every((track, i) => {
+    const prev = cached.tracks[i];
+    const lanes = track.lanes || [];
+    return track.start === prev.start && track.end === prev.end && track.kind === prev.kind &&
+      lanes.length === (prev.lanes?.length || 0) && lanes.every((lane, k) => lane.session === prev.lanes[k].session);
+  })) return null;
+  return file.lines.every((line, i) => line === cached.lines[i]) ? cached.items : null;
+}
+
+
 function renderOutline() {
   const box = $("tab-outline");
+  if (box.hidden) return;
   const file = state.file;
-  state.outline = file?.lines ? outlineOf(file) : [];
-  if (!file?.lines) return box.replaceChildren(h("p", { class: "none" }, "Open a file to see its functions and who wrote them."));
-  if (!state.outline.length) return box.replaceChildren(h("p", { class: "none" }, `No functions or classes found in ${base(file.path)}.`));
-  const sessions = new Set(state.outline.flatMap((item) => item.owners.map(([id]) => id)));
-  box.replaceChildren(
-    h("p", { class: "ohead" }, h("b", {}, base(file.path)), h("span", {}, [plural(state.outline.length, "item"), sessions.size ? plural(sessions.size, "session") : ""].filter(Boolean).join(" · "))),
-    ...state.outline.map(outlineRow),
-  );
-  markOutline();
+  if (outlineView.file === file) {
+    updateOutlineFocus();
+    return markOutline();
+  }
+  if (!file?.lines) {
+    Object.assign(outlineView, { file, rows: [] });
+    return box.replaceChildren(h("p", { class: "none" }, "Open a file to see its functions and who wrote them."));
+  }
+  if (outlineView.file !== undefined) {
+    Object.assign(outlineView, { file: undefined, rows: [] });
+    box.replaceChildren();
+  }
+  if (cancelOutline) return;
+  const job = syntaxJob;
+  cancelOutline = idleWork(() => {
+    cancelOutline = null;
+    if (file !== state.file || box.hidden) return;
+    if (file.outline === undefined) file.outline = cachedOutline(file);
+    if (!file.outline && job?.outlineNeedsTokens && job.next < file.lines.length) return scheduleSyntax();
+    const items = file.outline ??= outlineOf(file, job?.tokens);
+    outlines.set(file.path, { lines: file.lines, tracks: file.tracks, items });
+    const rows = items.map(outlineRow);
+    Object.assign(outlineView, { file, rows, focus: state.focus });
+    if (!rows.length) return box.replaceChildren(h("p", { class: "none" }, `No functions or classes found in ${base(file.path)}.`));
+    const sessions = new Set(items.flatMap((item) => item.owners.map(([id]) => id)));
+    const body = document.createDocumentFragment();
+    for (const row of rows) body.append(row);
+    box.replaceChildren(
+      h("p", { class: "ohead" }, h("b", {}, base(file.path)), h("span", {}, [plural(rows.length, "item"), sessions.size ? plural(sessions.size, "session") : ""].filter(Boolean).join(" · "))),
+      body,
+    );
+    markOutline();
+  });
+}
+
+function updateOutlineFocus() {
+  if (outlineView.focus === state.focus) return;
+  outlineView.focus = state.focus;
+  outlineView.rows.forEach((row, i) => {
+    const item = outlineView.file.outline[i];
+    row.classList.toggle("dim", !!state.focus && !item.owners.some(([id]) => id === state.focus) && !item.past.includes(state.focus));
+  });
 }
 
 // The innermost item around the selected line.
 function markOutline() {
   const box = $("tab-outline");
+  if (box.hidden || outlineView.file !== state.file) return;
   box.querySelector('.oitem[aria-current="true"]')?.removeAttribute("aria-current");
-  if (!state.line || !state.outline?.length) return;
-  const at = state.outline.findLast((item) => item.line <= state.line && state.line <= item.end);
+  if (!state.line || !state.file?.outline?.length) return;
+  const at = state.file.outline.findLast((item) => item.line <= state.line && state.line <= item.end);
   const row = at && box.querySelector(`.oitem[data-line="${at.line}"]`);
   if (!row) return;
   row.setAttribute("aria-current", "true");
@@ -1214,49 +1361,77 @@ function markOutline() {
 /* ---------- Find in file ---------- */
 
 // Matches are painted with the CSS highlight API, so the line rows stay untouched.
-const find = { query: "", case: false, hits: [], at: -1 };
+const find = { query: "", case: false, hits: [], at: -1, pending: false, cancel: null, steps: [] };
 const MAX_FIND = 5000;
 
-function setFind(query, matchCase = find.case) {
+function setFind(query, matchCase = find.case, delay = 0) {
   Object.assign(find, { query, case: matchCase, at: -1 });
   $("find-case").setAttribute("aria-pressed", String(find.case));
-  paintFind();
+  scanFind(true, delay);
 }
 
-function paintFind() {
+function scanFind(jump = false, delay = 0) {
+  find.cancel?.();
+  find.cancel = null;
   find.hits = [];
+  find.steps = [];
   const lines = state.file?.lines;
-  if (find.query && lines) {
-    const needle = find.case ? find.query : find.query.toLowerCase();
-    for (let i = 0; i < lines.length && find.hits.length < MAX_FIND; i++) {
-      const text = find.case ? lines[i] : lines[i].toLowerCase();
-      for (let at = text.indexOf(needle); at >= 0 && find.hits.length < MAX_FIND; at = text.indexOf(needle, at + needle.length)) {
-        find.hits.push({ line: i + 1, at });
-      }
-    }
-  }
-  if (find.at >= find.hits.length) find.at = -1;
+  const needle = find.case ? find.query : find.query.toLowerCase();
+  find.pending = !!(needle && lines?.length);
   drawFind();
+  if (!find.pending) {
+    find.at = -1;
+    return;
+  }
+  let i = 0;
+  const slice = (deadline) => {
+    const start = performance.now();
+    const before = find.hits.length;
+    do {
+      const stop = Math.min(lines.length, i + 32);
+      while (i < stop && find.hits.length < MAX_FIND) {
+        const text = find.case ? lines[i] : lines[i].toLowerCase();
+        for (let at = text.indexOf(needle); at >= 0 && find.hits.length < MAX_FIND; at = text.indexOf(needle, at + needle.length)) {
+          find.hits.push({ line: i + 1, at });
+        }
+        i++;
+      }
+    } while (i < lines.length && find.hits.length < MAX_FIND && withinSlice(deadline, start));
+    if (i < lines.length && find.hits.length < MAX_FIND) {
+      if (find.hits.length > before && find.hits[before].line <= fileView.last) drawFind();
+      find.cancel = idleWork(slice);
+      return;
+    }
+    find.cancel = null;
+    find.pending = false;
+    if (find.at >= find.hits.length) find.at = -1;
+    drawFind();
+    if (find.steps.length) for (const step of find.steps) stepFind(step);
+    else if (jump && find.hits.length) scrollToFileRow(find.hits[nearestHit(1)].line - 1);
+    find.steps = [];
+  };
+  if (delay) {
+    const id = setTimeout(() => { find.cancel = idleWork(slice); }, delay);
+    find.cancel = () => clearTimeout(id);
+  } else find.cancel = idleWork(slice);
 }
 
 function drawFind() {
   const n = find.hits.length;
   if (window.Highlight && CSS.highlights) {
     const range = (hit) => {
-      const node = $(`L${hit.line}`)?.querySelector(".src")?.firstChild;
-      if (!node) return null;
-      try {
-        const r = new Range();
-        r.setStart(node, hit.at);
-        r.setEnd(node, hit.at + find.query.length);
-        return r;
-      } catch {
-        return null;
-      }
+      const node = fileView.mounted.get(hit.line - 1)?.line?.lastElementChild.firstChild;
+      const end = hit.at + find.query.length;
+      if (!node || end > node.length) return null;
+      return new StaticRange({ startContainer: node, startOffset: hit.at, endContainer: node, endOffset: end });
     };
-    const all = find.hits.map(range).filter(Boolean);
-    if (all.length) {
-      const mark = new Highlight(...all);
+    const mark = new Highlight();
+    const first = lowerBound(n, (i) => find.hits[i].line <= fileView.first);
+    for (let i = first; i < n && find.hits[i].line <= fileView.last; i++) {
+      const r = range(find.hits[i]);
+      if (r) mark.add(r);
+    }
+    if (mark.size) {
       mark.priority = 1; // above the syntax colors
       CSS.highlights.set("find", mark);
     } else CSS.highlights.delete("find");
@@ -1267,19 +1442,27 @@ function drawFind() {
       CSS.highlights.set("find-current", mark);
     } else CSS.highlights.delete("find-current");
   }
-  $("find-count").textContent = !find.query ? "" : !n ? "No results" : find.at >= 0 ? `${find.at + 1} of ${n}` : n >= MAX_FIND ? `${n}+` : String(n);
-  $("find-prev").disabled = $("find-next").disabled = !n;
+  const count = !find.query || find.pending ? "" : !n ? "No results" : find.at >= 0 ? `${find.at + 1} of ${n}` : n >= MAX_FIND ? `${n}+` : String(n);
+  const label = $("find-count");
+  if (label.textContent !== count) label.textContent = count;
+  $("find-prev").disabled = $("find-next").disabled = find.pending || !n;
 }
 
 // The first match at or after the selected line, or the last one at or before it.
 function nearestHit(step) {
   const line = state.line || 1;
-  const i = step > 0 ? find.hits.findIndex((hit) => hit.line >= line) : find.hits.findLastIndex((hit) => hit.line <= line);
-  return i >= 0 ? i : step > 0 ? 0 : find.hits.length - 1;
+  const n = find.hits.length;
+  if (step > 0) {
+    const i = lowerBound(n, (i) => find.hits[i].line < line);
+    return i < n ? i : 0;
+  }
+  const i = lowerBound(n, (i) => find.hits[i].line <= line);
+  return i > 0 ? i - 1 : n - 1;
 }
 
 // Stepping to a match selects its line, so the panel shows who wrote it.
 function stepFind(step) {
+  if (find.pending) return find.steps.push(step);
   const n = find.hits.length;
   if (!n) return;
   find.at = find.at < 0 ? nearestHit(step) : (find.at + step + n) % n;
@@ -1302,8 +1485,7 @@ function openFind() {
 }
 
 function typeFind() {
-  setFind($("find-input").value);
-  if (find.hits.length) $(`L${find.hits[nearestHit(1)].line}`)?.scrollIntoView({ block: "center" });
+  setFind($("find-input").value, find.case, 100);
 }
 
 function closeFind() {
@@ -1319,7 +1501,7 @@ async function openFile(path, line = null, { keepFocus = true, keepPanel = false
   const request = ++nav.fileRequest;
   let file;
   try {
-    file = await api("file", { path });
+    file = await api("file", { path, deleted: 0 });
   } catch (err) {
     if (request === nav.fileRequest) toast(err.message);
     return;
@@ -1330,8 +1512,7 @@ async function openFile(path, line = null, { keepFocus = true, keepPanel = false
   addTab(file.path);
   ensureExpanded(file.path);
   record("File tracks", file.cypher, { path: rel(path) });
-  state.byLine = [];
-  for (const r of file.tracks) for (let n = r.start; n <= r.end; n++) state.byLine[n] = r;
+  file.tracks.sort((a, b) => a.start - b.start);
   // A file edited after the build can be shorter than the graph remembers.
   const last = file.lines?.length ?? 0;
   state.gapsAt = new Map();
@@ -1346,9 +1527,8 @@ async function openFile(path, line = null, { keepFocus = true, keepPanel = false
   state.gap = null;
   renderFile();
   renderTabs();
-  renderFiles();
+  markFileRow(true);
   renderCrossings();
-  $("tab-files").querySelector('.tree-row[aria-current="true"]')?.scrollIntoView({ block: "nearest" });
   if (gap != null && state.gapsAt.has(gap)) selectGap(gap, { open: true, scroll: true, panel });
   else if (line && file.lines?.length) selectLine(line, { scroll: true, panel });
   else if (panel || !keepPanel) showPanel(panel || { view: "intro" });
@@ -1361,7 +1541,10 @@ async function openFile(path, line = null, { keepFocus = true, keepPanel = false
 function addTab(path) {
   if (state.tabs.includes(path)) return;
   state.tabs.push(path);
-  while (state.tabs.length > MAX_TABS) state.tabs.splice(state.tabs.findIndex((p) => p !== path), 1);
+  while (state.tabs.length > MAX_TABS) {
+    const [closed] = state.tabs.splice(state.tabs.findIndex((p) => p !== path), 1);
+    outlines.delete(closed);
+  }
 }
 
 function renderTabs() {
@@ -1387,6 +1570,7 @@ function closeTab(path) {
   const i = state.tabs.indexOf(path);
   if (i < 0) return;
   state.tabs.splice(i, 1);
+  outlines.delete(path);
   if (state.file?.path !== path) return renderTabs();
   const next = state.tabs[i] || state.tabs[i - 1];
   if (next) return openFile(next);
@@ -1397,7 +1581,8 @@ function closeTab(path) {
 function clearFile() {
   state.file = null;
   state.line = null;
-  state.byLine = [];
+  resetFileView();
+  nav.fileRequest++;
   state.gapsAt = new Map();
   state.gap = null;
   $("gaps-toggle").hidden = true;
@@ -1407,16 +1592,14 @@ function clearFile() {
   $("lines").replaceChildren();
   $("find").hidden = true;
   paintSyntax();
-  paintFind();
+  scanFind();
   renderOutline();
   $("code-empty").hidden = false;
   $("code-empty").replaceChildren(...(state.overview ? ["Pick a file ", h("kbd", {}, `${MOD}P`), ", then click a line."] : []));
   renderFocus();
   renderTabs();
-  if (state.overview) {
-    renderFiles();
-    renderCrossings();
-  }
+  markFileRow();
+  if (state.overview) renderCrossings();
   showIntro();
   writeHash();
 }
@@ -1425,6 +1608,254 @@ function laneIds(range) {
   const seen = [];
   for (const lane of range?.lanes || []) if (!seen.includes(lane.session)) seen.push(lane.session);
   return seen;
+}
+
+// Positions are counted in ordinary rows, with an optional deletion immediately
+// before each row. The last position can hold an end-of-file deletion.
+function lowerBound(length, before) {
+  let lo = 0, hi = length;
+  while (lo < hi) {
+    const mid = lo + Math.floor((hi - lo) / 2);
+    if (before(mid)) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
+function trackAt(tracks, line) {
+  const range = tracks[lowerBound(tracks.length, (i) => tracks[i].end < line)];
+  return range?.start <= line ? range : null;
+}
+
+function fileLayout(count, rowHeight, gaps) {
+  // Prefix sums of deletion heights, with logarithmic updates after measurement.
+  const sums = new Float64Array(gaps.length + 1);
+  const heights = new Float64Array(gaps.length);
+  const gapIndex = (after) => lowerBound(gaps.length, (i) => gaps[i] < after);
+  const height = (after) => {
+    const index = gapIndex(after);
+    return gaps[index] === after ? heights[index] : 0;
+  };
+  const offset = (after) => {
+    let y = Math.min(after, count) * rowHeight;
+    for (let i = gapIndex(after); i > 0; i -= i & -i) y += sums[i];
+    return y;
+  };
+  const setHeight = (after, value) => {
+    const index = gapIndex(after);
+    if (gaps[index] !== after) return;
+    const delta = value - heights[index];
+    heights[index] = value;
+    for (let i = index + 1; i < sums.length; i += i & -i) sums[i] += delta;
+  };
+  const at = (y) => Math.max(0, lowerBound(count + 1, (i) => offset(i) <= y) - 1);
+  return { gaps, offset, setHeight, height, at, count, rowHeight };
+}
+
+function visibleRows(layout, top, height, buffer) {
+  return [layout.at(top - buffer), layout.at(top + height + buffer) + 1];
+}
+
+const FILE_BUFFER = 16;
+const fileView = { file: null, mounted: new Map(), frame: 0, observer: null };
+
+function resetFileView() {
+  cancelAnimationFrame(fileView.frame);
+  fileView.cancelWidth?.();
+  fileView.observer?.disconnect();
+  clearCodeHover?.();
+  resetSyntax();
+  Object.assign(outlineView, { file: undefined, rows: [] });
+  $("tab-outline").replaceChildren();
+  Object.assign(fileView, {
+    file: null, mounted: new Map(), layout: null, frame: 0, observer: null, cancelWidth: null, first: 0, last: 0,
+  });
+  $("lines").style.removeProperty("--source-width");
+}
+
+function mountFile(file) {
+  const list = $("lines");
+  const scroll = $("code-scroll");
+  const { scrollTop, scrollLeft, clientHeight } = scroll;
+  resetFileView();
+  const style = getComputedStyle(list);
+  const rowHeight = parseFloat(style.lineHeight);
+  const padding = parseFloat(style.paddingTop);
+  const bottom = parseFloat(style.paddingBottom);
+  const gaps = [...state.gapsAt.keys()].sort((a, b) => a - b);
+  const layout = fileLayout(file.lines?.length || 0, rowHeight, gaps);
+  const before = h("li", { class: "line-space", "aria-hidden": "true" });
+  const after = h("li", { class: "line-space", "aria-hidden": "true" });
+  Object.assign(fileView, { file, layout, padding, bottom, before, after });
+  const lang = SYNTAX.language(file.path, file.lines?.[0]);
+  const scan = file.lines && SYNTAX.scanner(lang);
+  if (scan) syntaxJob = { file, scan, tokens: [], next: 0, visibleStart: 0, visibleEnd: 0, outlineNeedsTokens: lang !== "markdown" };
+  if (typeof ResizeObserver !== "undefined") {
+    fileView.observer = new ResizeObserver((entries) => {
+      const changes = [];
+      for (const { target, borderBoxSize } of entries) {
+        if (target === scroll) continue;
+        const index = Number(target.dataset.after);
+        if (fileView.mounted.get(index)?.gap !== target) continue;
+        const height = (borderBoxSize?.[0]?.blockSize ?? target.getBoundingClientRect().height) + 4;
+        if (Math.abs(height - layout.height(index)) > 0.01) changes.push([index, height]);
+      }
+      if (changes.length) adjustFileLayout(() => {
+        for (const [index, height] of changes) layout.setHeight(index, height);
+      });
+      else queueFileRows();
+    });
+    fileView.observer.observe(scroll);
+  }
+  for (const gap of gaps) layout.setHeight(gap, estimatedGapHeight(gap));
+  list.replaceChildren(before, after);
+  const top = Math.max(0, Math.min(scrollTop, padding + layout.offset(layout.count + 1) + bottom - clientHeight));
+  renderFileRows(top, clientHeight);
+  scroll.scrollTop = top;
+  scroll.scrollLeft = scrollLeft;
+  measureSourceWidth(file);
+}
+
+// Keep the horizontal scrollbar sized for the whole source, including lines
+// that currently have no elements. The first visible rows use their own width.
+function measureSourceWidth(file) {
+  if (!file.lines?.length) return;
+  const list = $("lines");
+  let ctx, char, columns, widest = 0, i = 0;
+  const measure = (deadline) => {
+    if (!ctx) {
+      const row = fileView.mounted.values().next().value?.line || list.querySelector(".ln");
+      if (!row) {
+        fileView.cancelWidth = null;
+        return;
+      }
+      const style = getComputedStyle(row);
+      const text = getComputedStyle(row.lastElementChild);
+      columns = style.gridTemplateColumns.split(" ").slice(0, 3).reduce((n, width) => n + parseFloat(width), 0) + parseFloat(text.paddingRight);
+      ctx = document.createElement("canvas").getContext("2d");
+      if (!ctx) return;
+      ctx.font = `${text.fontSize} ${text.fontFamily}`;
+      char = ctx.measureText("0").width;
+    }
+    const start = performance.now();
+    do {
+      const stop = Math.min(file.lines.length, i + 64);
+      while (i < stop) {
+        const line = file.lines[i++];
+        let width = Math.max(1, line.length) * char;
+        if (/[^ -~]/.test(line)) {
+          width = 0;
+          const tab = char * 4;
+          const parts = line.split("\t");
+          for (const [k, part] of parts.entries()) {
+            if (k) width = (Math.floor(width / tab) + 1) * tab;
+            width += ctx.measureText(part).width;
+          }
+        }
+        widest = Math.max(widest, width);
+      }
+    } while (i < file.lines.length && withinSlice(deadline, start));
+    if (i < file.lines.length) fileView.cancelWidth = idleWork(measure);
+    else {
+      list.style.setProperty("--source-width", `${widest + columns}px`);
+      fileView.cancelWidth = null;
+    }
+  };
+  fileView.cancelWidth = idleWork(measure);
+}
+
+function queueFileRows() {
+  if (!fileView.file || fileView.frame) return;
+  fileView.frame = requestAnimationFrame(() => {
+    fileView.frame = 0;
+    renderFileRows();
+  });
+}
+
+function renderFileRows(top = $("code-scroll").scrollTop, height = $("code-scroll").clientHeight) {
+  const { file, layout, padding, before, after, mounted, observer } = fileView;
+  if (!file || file !== state.file) return;
+  const buffer = FILE_BUFFER * layout.rowHeight;
+  const [first, last] = visibleRows(layout, top - padding, height, buffer);
+  Object.assign(fileView, { first, last });
+  const topSpace = `${layout.offset(first)}px`;
+  const bottomSpace = `${layout.offset(layout.count + 1) - layout.offset(last)}px`;
+  if (before.style.height !== topSpace) before.style.height = topSpace;
+  if (after.style.height !== bottomSpace) after.style.height = bottomSpace;
+  let changed = false;
+  for (const [index, { gap, line }] of mounted) {
+    if (first <= index && index < last) continue;
+    if (gap) {
+      observer?.unobserve(gap);
+      gap.remove();
+    }
+    line?.remove();
+    mounted.delete(index);
+    changed = true;
+  }
+  let next = after;
+  for (let index = last - 1; index >= first; index--) {
+    let rows = mounted.get(index);
+    if (!rows) {
+      const gap = state.gapsAt.has(index) ? gapRow(index) : null;
+      const line = index < layout.count ? lineRow(file.lines[index], index + 1) : null;
+      if (line) next.before(line);
+      if (gap) {
+        (line || next).before(gap);
+        if (isGapOpen(index)) observer?.observe(gap);
+      }
+      rows = { gap, line };
+      mounted.set(index, rows);
+      changed = true;
+    }
+    if (rows.gap?.deletedSources) {
+      const gapTop = padding + layout.offset(index);
+      renderDeletedRows(rows.gap, top - gapTop - buffer, top + height - gapTop + buffer);
+    }
+    next = rows.gap || rows.line || next;
+  }
+  if (changed) {
+    paintSyntax();
+    drawFind();
+  }
+}
+
+function adjustFileLayout(update, selected = false) {
+  const { file, layout, padding, bottom, mounted } = fileView;
+  if (!file || file !== state.file) return;
+  const scroll = $("code-scroll");
+  const top = scroll.scrollTop;
+  const height = scroll.clientHeight;
+  const y = top - padding;
+  let at = layout.at(y);
+  let line = y >= layout.offset(at) + layout.height(at);
+  if (selected) {
+    const index = state.line ? state.line - 1 : state.gap;
+    if (mounted.has(index)) {
+      at = index;
+      line = !!state.line;
+    }
+  }
+  const anchor = () => layout.offset(at) + (line ? layout.height(at) : 0);
+  const before = anchor();
+  const inGap = !line && layout.offset(at) <= y && y < layout.offset(at) + layout.height(at);
+  update();
+  const delta = inGap ? Math.min(0, anchor() + layout.height(at) - y) : 0;
+  const next = Math.max(0, Math.min(top + anchor() - before + delta, padding + layout.offset(layout.count + 1) + bottom - height));
+  renderFileRows(next, height);
+  if (top !== next) scroll.scrollTop = next;
+}
+
+function scrollToFileRow(index, gap = false) {
+  const { file, layout, padding, bottom } = fileView;
+  if (!file || file !== state.file) return;
+  const scroll = $("code-scroll");
+  const height = scroll.clientHeight;
+  const size = gap ? layout.height(index) : layout.rowHeight;
+  const y = padding + layout.offset(index) + (gap ? 0 : layout.height(index));
+  const top = Math.max(0, Math.min(y + (size - height) / 2, padding + layout.offset(layout.count + 1) + bottom - height));
+  renderFileRows(top, height);
+  scroll.scrollTop = top;
 }
 
 function renderFile() {
@@ -1451,48 +1882,93 @@ function renderFile() {
   $("lines").style.setProperty("--tracks-w", `${12 + width * 8}px`);
   $("lines").style.setProperty("--who-w", f.tracks.some((r) => r.kind === "agent") ? "16px" : "0px");
 
-  const lines = f.lines || [];
-  const rows = [];
-  for (let i = 0; i <= lines.length; i++) {
-    if (state.gapsAt.has(i)) rows.push(gapRow(i));
-    if (i < lines.length) rows.push(lineRow(lines[i], i + 1));
-  }
-  $("lines").replaceChildren(...rows);
+  scanFind();
+  mountFile(f);
   renderGapsToggle();
-  paintSyntax();
-  paintFind();
   renderOutline();
+}
+
+// Share the idle scheduler with other whole-file scans. Each slice yields even
+// when the browser does not provide an idle deadline.
+function idleWork(work) {
+  if (typeof requestIdleCallback === "function") {
+    const id = requestIdleCallback(work);
+    return () => cancelIdleCallback(id);
+  }
+  const id = setTimeout(() => work(null), 0);
+  return () => clearTimeout(id);
+}
+
+function withinSlice(deadline, start) {
+  return performance.now() - start < 6 && (!deadline || deadline.timeRemaining() > 1);
+}
+
+let syntaxJob = null;
+let cancelOutline = null;
+
+function resetSyntax() {
+  syntaxJob?.cancel?.();
+  syntaxJob = null;
+  cancelOutline?.();
+  cancelOutline = null;
+}
+
+function scheduleSyntax() {
+  const job = syntaxJob;
+  if (!job || job.cancel) return;
+  const outline = () => !job.file.outline && !$("tab-outline").hidden;
+  const goal = () => outline() && job.outlineNeedsTokens ? job.file.lines.length : job.visibleEnd;
+  if (job.next >= goal()) return;
+  job.cancel = idleWork((deadline) => {
+    job.cancel = null;
+    const end = goal();
+    const start = performance.now();
+    const from = job.next;
+    do {
+      const stop = Math.min(end, job.next + 32);
+      while (job.next < stop) {
+        job.tokens[job.next] = job.scan(job.file.lines[job.next]);
+        job.next++;
+      }
+    } while (job.next < end && withinSlice(deadline, start));
+    if (from < job.visibleEnd && job.next > job.visibleStart) paintSyntax();
+    if (outline() && job.next === job.file.lines.length) renderOutline();
+    scheduleSyntax();
+  });
 }
 
 // Syntax colors are highlight ranges over each line's one text node, like the
 // find marks, so the rows hold plain text and offsets into a line stay true.
-const MAX_SYNTAX_LINES = 20000;
-
 function paintSyntax() {
   if (!window.Highlight || !CSS.highlights) return;
   for (const type of SYNTAX.TYPES) CSS.highlights.delete(`syn-${type}`);
-  const tokens = state.file?.lines && syntaxTokens(state.file);
-  if (!tokens) return;
-  const rows = document.querySelectorAll("#lines > .ln > .src");
+  const job = syntaxJob;
+  if (!job) return;
   const marks = new Map();
-  tokens.forEach((list, i) => {
-    const node = rows[i]?.firstChild;
-    if (!node) return;
-    for (const [start, end, type] of list) {
+  job.visibleStart = job.file.lines.length;
+  job.visibleEnd = 0;
+  for (const [i, { line }] of fileView.mounted) {
+    if (!line) continue;
+    job.visibleStart = Math.min(job.visibleStart, i);
+    job.visibleEnd = Math.max(job.visibleEnd, i + 1);
+    const node = line.lastElementChild.firstChild;
+    for (const [start, end, type] of job.tokens[i] || []) {
       if (!marks.has(type)) marks.set(type, new Highlight());
       marks.get(type).add(new StaticRange({ startContainer: node, startOffset: start, endContainer: node, endOffset: end }));
     }
-  });
+  }
   for (const [type, mark] of marks) CSS.highlights.set(`syn-${type}`, mark);
+  scheduleSyntax();
 }
 
 function lineRow(text, n) {
-  const range = state.byLine[n];
+  const range = trackAt(state.file?.tracks || [], n);
   const ids = laneIds(range);
   const tracks = [];
   if (range && range.kind !== "agent") tracks.push(h("i", { class: KIND[range.kind]?.cls || "k-unknown" }));
   ids.slice(0, MAX_LANES - tracks.length).forEach((id, k) => tracks.push(h("i", { class: k || tracks.length ? "older" : "", style: `background:${color(id)}` })));
   const cls = ["ln"];
+  if (state.line === n) cls.push("sel");
   if (range && range.start === n) cls.push("top");
   if (ids.length >= 2) cls.push("cross");
   if (state.focus && !ids.includes(state.focus)) cls.push("dim");
@@ -1510,7 +1986,7 @@ function lineRow(text, n) {
 // names the session and when it wrote the block; clicking it opens that step.
 function whoMark(range, n) {
   const id = range?.kind === "agent" ? laneIds(range)[0] : null;
-  const prev = state.byLine[n - 1];
+  const prev = trackAt(state.file.tracks, n - 1);
   const s = id && state.sessions.get(id);
   const logo = s && (prev?.kind !== "agent" || laneIds(prev)[0] !== id) ? sourceLogo(s.agent) : null;
   if (!logo) return h("span", { class: "who" });
@@ -1529,30 +2005,62 @@ const gapLines = (list) => list.reduce((n, g) => n + (g.removed || 0), 0);
 
 function gapRow(after) {
   const list = state.gapsAt.get(after);
-  const open = state.showGaps || state.openGaps.has(after);
+  const open = isGapOpen(after);
+  if (open) for (const g of list) loadGapText(state.file, g);
   const cls = ["gap"];
   if (open) cls.push("open");
   if (state.gap === after && !state.line) cls.push("sel");
   if (state.focus && !list.some((g) => g.session === state.focus)) cls.push("dim");
   const label = `${plural(gapLines(list), "line")} deleted ${gapWhere(after)}`;
-  return h(
+  const row = h(
     "li",
     { class: cls.join(" "), "data-after": after, id: `G${after}`, style: `--gap:${gapColor(list[0])}` },
     h("button", { type: "button", class: "gap-mark", "aria-expanded": String(open), "aria-label": open ? `Hide the ${label}` : `Show the ${label}`, title: label }),
-    open ? list.map((g) => gapBlock(g, after)) : null,
   );
+  if (!open) return row;
+  row.deletedSources = [];
+  let offset = 2; // Top margin of the open deletion.
+  for (const [i, g] of list.entries()) {
+    const size = gapBlockSize(g);
+    const source = size.shown ? h("div", { style: `height:${fileView.layout.rowHeight * size.shown}px` }) : null;
+    offset += (i ? 1 : 0) + fileView.layout.rowHeight;
+    if (source) row.deletedSources.push({ source, offset, g, count: size.shown });
+    const block = gapBlock(g, after, source, size.more);
+    if (size.pending) block.style.minHeight = `${size.height + (i ? 1 : 0)}px`;
+    row.append(block);
+    offset += size.height - fileView.layout.rowHeight;
+  }
+  return row;
 }
 
-function gapBlock(g, after) {
+function renderDeletedRows(gap, top, bottom) {
+  const height = fileView.layout.rowHeight;
+  for (const view of gap.deletedSources) {
+    const { source, offset, g, count } = view;
+    const text = gapTextLines(g);
+    if (!text.length) continue;
+    const first = Math.max(0, Math.min(count, Math.floor((top - offset) / height)));
+    const last = Math.max(first, Math.min(count, Math.ceil((bottom - offset) / height)));
+    if (first === view.first && last === view.last) continue;
+    Object.assign(view, { first, last });
+    const body = document.createDocumentFragment();
+    if (first < last && first) body.append(h("div", { style: `height:${first * height}px`, "aria-hidden": "true" }));
+    for (let i = first; i < last; i++) {
+      body.append(h("div", { class: "gap-ln" },
+        h("span", { class: "tracks", "aria-hidden": "true" }, h("i")),
+        h("span", { class: "num", "aria-hidden": "true" }, "−"),
+        h("span", { class: "src" }, text[i] || " "),
+      ));
+    }
+    source.replaceChildren(body);
+  }
+}
+
+function gapBlock(g, after, source, more) {
   const kind = g.kind === "agent" && g.session ? null : KIND[g.kind] || KIND.unknown;
   const who = kind
     ? [h("i", { class: `key ${kind.cls}` }), h("span", { class: "who" }, kind.who)]
     : [h("i", { class: "dot", style: `background:${color(g.session)}` }), h("span", { class: "who" }, sessionLabel(g.session))];
-  const text = g.text ? g.text.replace(/\n$/, "").split("\n") : [];
-  const full = state.fullGaps.has(g.id);
-  const shown = full ? text : text.slice(0, GAP_PREVIEW);
-  const ghost = (src) =>
-    h("div", { class: "gap-ln" }, h("span", { class: "tracks", "aria-hidden": "true" }, h("i")), h("span", { class: "num", "aria-hidden": "true" }, "−"), h("span", { class: "src" }, src || " "));
   return h(
     "div",
     { class: "gap-block", style: `--gap:${gapColor(g)}`, "data-gap": g.id },
@@ -1563,8 +2071,8 @@ function gapBlock(g, after) {
       h("span", { class: "num" }),
       h("span", { class: "gap-what" }, h("b", {}, `Deleted ${plural(g.removed, "line")}`), ...who, g.ts ? h("span", { class: "when" }, shortWhen(g.ts)) : null),
     ),
-    text.length ? shown.map(ghost) : h("div", { class: "gap-ln none" }, h("span", { class: "tracks" }), h("span", { class: "num" }), h("span", { class: "src" }, "The logs don't show these lines' text")),
-    text.length > shown.length
+    source || h("div", { class: "gap-ln none" }, h("span", { class: "tracks" }), h("span", { class: "num" }), h("span", { class: "src" }, g.loading ? "Loading deleted lines…" : g.bodyError || "The logs don't show these lines' text")),
+    more
       ? h(
           "button",
           {
@@ -1576,14 +2084,65 @@ function gapBlock(g, after) {
               redrawGap(after);
             },
           },
-          `Show ${plural(text.length - shown.length, "more line")}`,
+          `Show ${plural(more, "more line")}`,
         )
       : null,
   );
 }
 
+const isGapOpen = (after) => state.showGaps || state.openGaps.has(after);
+
+function gapTextLines(g) {
+  return g.bodyLines ??= g.text ? g.text.replace(/\n$/, "").split("\n") : [];
+}
+
+function loadGapText(file, g) {
+  if (g.loading || g.bodyReady || g.bodyError || g.text != null || g.id == null) return g.loading;
+  g.loading = api("deleted", { path: file.path, id: g.id }).then(({ text }) => {
+    g.text = text;
+    g.bodyReady = true;
+    delete g.bodyLines;
+  }).catch((err) => {
+    g.bodyError = err.message;
+  }).finally(() => {
+    g.loading = null;
+    const after = Math.min(g.after, file.lines?.length ?? 0);
+    if (state.file === file && isGapOpen(after)) redrawGap(after);
+  });
+  return g.loading;
+}
+
+function gapBlockSize(g) {
+  const pending = !g.bodyReady && g.text == null && g.id != null && !g.bodyError;
+  const size = pending ? g.removed : gapTextLines(g).length;
+  const rows = state.fullGaps.has(g.id) ? size : Math.min(GAP_PREVIEW, size);
+  const rowHeight = fileView.layout.rowHeight;
+  const more = size - rows;
+  // The extra button has one line, two borders and a 6px vertical margin.
+  const height = rowHeight * (1 + Math.max(1, rows)) + (more ? rowHeight + 8 : 0);
+  return { shown: pending ? 0 : rows, more: pending ? 0 : more, height, pending };
+}
+
+function estimatedGapHeight(after) {
+  if (!isGapOpen(after)) return 0;
+  return state.gapsAt.get(after).reduce((sum, g, i) => sum + gapBlockSize(g).height + (i ? 1 : 0), 4);
+}
+
+function replaceMountedGap(after) {
+  const rows = fileView.mounted.get(after);
+  if (!rows?.gap) return;
+  fileView.observer?.unobserve(rows.gap);
+  const row = gapRow(after);
+  rows.gap.replaceWith(row);
+  rows.gap = row;
+  if (isGapOpen(after)) fileView.observer?.observe(row);
+}
+
 function redrawGap(after) {
-  $(`G${after}`)?.replaceWith(gapRow(after));
+  adjustFileLayout(() => {
+    fileView.layout.setHeight(after, estimatedGapHeight(after));
+    replaceMountedGap(after);
+  });
 }
 
 function renderGapsToggle() {
@@ -1601,18 +2160,21 @@ function toggleAllGaps() {
   state.showGaps = !state.showGaps;
   store("papertrail-show-deletions", state.showGaps);
   state.openGaps.clear();
-  const keep = state.line ? $(`L${state.line}`) : state.gap != null ? $(`G${state.gap}`) : null;
-  const top = keep?.getBoundingClientRect().top;
-  renderFile();
-  // Keep the selected line where it was while blocks open and close above it.
-  const again = state.line ? $(`L${state.line}`) : state.gap != null ? $(`G${state.gap}`) : null;
-  if (again && top != null) $("code-scroll").scrollTop += again.getBoundingClientRect().top - top;
+  if (state.showGaps) for (const list of state.gapsAt.values()) for (const g of list) delete g.bodyError;
+  adjustFileLayout(() => {
+    for (const after of fileView.layout.gaps) fileView.layout.setHeight(after, estimatedGapHeight(after));
+    for (const [after, { gap }] of fileView.mounted) if (gap) replaceMountedGap(after);
+  }, true);
+  renderGapsToggle();
 }
 
 function toggleGap(after) {
   if (state.showGaps) return;
   if (state.openGaps.has(after)) state.openGaps.delete(after);
-  else state.openGaps.add(after);
+  else {
+    state.openGaps.add(after);
+    for (const g of state.gapsAt.get(after)) delete g.bodyError;
+  }
   redrawGap(after);
 }
 
@@ -1641,13 +2203,13 @@ function selectGap(after, { open = false, scroll = false, panel } = {}) {
     redrawGap(after);
   }
   markSelected();
-  if (scroll) $(`G${after}`)?.scrollIntoView({ block: "center" });
+  if (scroll) scrollToFileRow(after, true);
   showPanel(panel || { view: "trace", path: state.file.path, gap: after });
   writeHash();
 }
 
 function describeOwner(n) {
-  const range = state.byLine[n];
+  const range = trackAt(state.file?.tracks || [], n);
   const num = h("b", {}, `Ln ${n}`);
   if (!range) return [num];
   // One dot per session that wrote this spot, newest first.
@@ -1664,29 +2226,31 @@ function describeOwner(n) {
 function focusBlocks() {
   const blocks = [];
   const n = state.file?.lines?.length || 0;
-  for (let i = 1; i <= n; i++) {
-    if (!laneIds(state.byLine[i]).includes(state.focus)) continue;
-    const last = blocks[blocks.length - 1];
-    if (last && last.end === i - 1) last.end = i;
-    else blocks.push({ start: i, end: i });
+  for (const range of state.file?.tracks || []) {
+    if (range.start > n) break;
+    if (!laneIds(range).includes(state.focus)) continue;
+    const end = Math.min(range.end, n);
+    const last = blocks.at(-1);
+    if (last && last.end + 1 === range.start) last.end = end;
+    else blocks.push({ start: range.start, end });
   }
   return blocks;
 }
 
 // Scrolls without selecting, so a conversation open in the panel stays open.
 function stepFocus(step) {
-  const blocks = focusBlocks();
+  const blocks = state.focusBlocks || [];
   if (!blocks.length) return;
   const n = blocks.length;
   const i = state.focusAt == null ? (step > 0 ? 0 : n - 1) : (state.focusAt + step + n) % n;
   state.focusAt = i;
-  const row = $(`L${blocks[i].start}`);
-  row?.scrollIntoView({ block: "center" });
-  for (let k = blocks[i].start; k <= blocks[i].end; k++) {
-    const el = $(`L${k}`);
-    el.classList.remove("flash");
-    void el.offsetWidth;
-    el.classList.add("flash");
+  const block = blocks[i];
+  scrollToFileRow(block.start - 1);
+  for (const [index, { line }] of fileView.mounted) {
+    if (line && block.start <= index + 1 && index < block.end) {
+      line.getAnimations().filter((a) => a.animationName === "line-flash").forEach((a) => { a.currentTime = 0; });
+      line.classList.add("flash");
+    }
   }
   $("focus-at").textContent = `${i + 1} of ${n}`;
 }
@@ -1696,7 +2260,7 @@ function renderFocus() {
   if (!state.focus) return (box.hidden = true);
   box.hidden = false;
   state.focusAt = null;
-  const blocks = focusBlocks();
+  const blocks = state.focusBlocks = focusBlocks();
   const lines = blocks.reduce((n, b) => n + b.end - b.start + 1, 0);
   box.replaceChildren(
     ...[
@@ -1716,16 +2280,22 @@ function renderFocus() {
   );
 }
 
-function setFocus(id) {
+function setFocus(id, { save = true } = {}) {
   state.focus = id;
-  if (state.file) renderFile();
-  if (state.line) markSelected();
+  if (state.file) {
+    for (const [index, { line, gap }] of fileView.mounted) {
+      line?.classList.toggle("dim", !!id && !laneIds(trackAt(state.file.tracks, index + 1)).includes(id));
+      gap?.classList.toggle("dim", !!id && !state.gapsAt.get(index).some((g) => g.session === id));
+    }
+    if (!$("tab-outline").hidden && outlineView.file === state.file) updateOutlineFocus();
+  }
+  renderFocus();
   renderSessions();
-  writeHash();
+  if (save) writeHash();
 }
 
 function markSelected() {
-  for (const el of document.querySelectorAll(".ln.sel, .gap.sel")) el.classList.remove("sel");
+  for (const el of $("lines").querySelectorAll(".ln.sel, .gap.sel")) el.classList.remove("sel");
   if (state.line) $(`L${state.line}`)?.classList.add("sel");
   else if (state.gap != null) $(`G${state.gap}`)?.classList.add("sel");
   markOutline();
@@ -1737,7 +2307,7 @@ function selectLine(n, { scroll = false, span = null, panel } = {}) {
   state.line = n;
   state.gap = null;
   markSelected();
-  if (scroll) $(`L${n}`)?.scrollIntoView({ block: "center" });
+  if (scroll) scrollToFileRow(n - 1);
   if (!panel) {
     const path = state.file.path;
     if (span && state.file.status !== "untracked") {
@@ -1756,6 +2326,7 @@ function selectLine(n, { scroll = false, span = null, panel } = {}) {
 // The panel shows either a plain message or the conversation view. The
 // conversation view keeps its line header fixed and scrolls only the chat.
 function setPanel(nodes, chat = false) {
+  stopPinPrompt?.();
   const panel = $("panel");
   panel.classList.toggle("chat-mode", chat);
   panel.replaceChildren(...[nodes].flat().filter(Boolean));
@@ -1838,9 +2409,10 @@ async function loadSpan(panel) {
 async function loadGapTrace(panel) {
   const { path, gap } = panel;
   let stops = state.file?.path === path && state.gapsAt.get(gap);
+  let otherFile = null;
   if (!stops) {
     try {
-      const file = await api("file", { path });
+      const file = otherFile = await api("file", { path, deleted: 0 });
       const last = file.lines?.length ?? 0;
       stops = (file.gaps || []).filter((g) => Math.min(g.after, last) === gap).reverse();
     } catch (err) {
@@ -1850,7 +2422,7 @@ async function loadGapTrace(panel) {
   }
   if (state.panel !== panel) return;
   const pick = Math.max(0, stops.findIndex((g) => g.session));
-  state.trace = { gap, n: gap, path, text: "", stops, pick };
+  state.trace = { gap, n: gap, path, text: "", stops, pick, otherFile };
   renderTraceView();
 }
 
@@ -1954,6 +2526,7 @@ function showStop(i, writer = null) {
   rememberPanel({ stop: { index: i, kind: r.kind, session: r.session, edit: r.edit }, writer: null });
   const body = $("chat-body");
   const gap = t.gap != null;
+  if (gap) gapConversationToken++;
   if (gap && gapOrigin(r, writer)) return;
   if (r.kind !== "agent" || !r.session) {
     const kind = KIND[r.kind] || KIND.unknown;
@@ -1967,9 +2540,29 @@ function showStop(i, writer = null) {
       ),
     );
   }
-  if (gap) return showConversation(body, r.session, { edit: r.edit, stop: r, tag: `deleted ${plural(r.removed, "line")}`, del: textSet(r.text) });
+  if (gap) return showGapConversation(body, r, r.session, { edit: r.edit, stop: r, tag: `deleted ${plural(r.removed, "line")}` }, "del");
   if (t.span) return showConversation(body, r.session, { edit: r.edit, stop: r, tag: r.lines ? `wrote ${plural(r.lines, "line")} here` : "rewritten since" });
   return showConversation(body, r.session, { edit: r.edit, stop: r, line: t.n, text: t.text });
+}
+
+let gapConversationToken = 0;
+
+function showGapConversation(box, deletion, session, target, key) {
+  const token = ++gapConversationToken;
+  const panel = state.panel;
+  const show = () => {
+    if (token === gapConversationToken && panel === state.panel) {
+      return showConversation(box, session, { ...target, [key]: textSet(deletion.text) });
+    }
+  };
+  // A restored deletion panel can be open while another file occupies the editor.
+  const otherFile = state.trace?.otherFile;
+  const loading = deletion.loading || (otherFile && loadGapText(otherFile, deletion));
+  if (!loading) return show();
+  stopPinPrompt?.();
+  showConversation.token = (showConversation.token || 0) + 1;
+  box.replaceChildren(h("div", { class: "empty" }, "Loading the conversation…"));
+  return loading.then(show);
 }
 
 const textSet = (text) => new Set((text || "").split("\n").map((s) => s.trim()).filter(Boolean));
@@ -1990,7 +2583,7 @@ function gapOrigin(r, restoreWriter) {
     rememberPanel({ writer: { session: w.session, edit: w.edit } });
     for (const el of document.querySelectorAll(".hchip, .writer")) el.setAttribute("aria-selected", "false");
     box.querySelector(`[data-session="${CSS.escape(w.session)}"]`)?.setAttribute("aria-selected", "true");
-    showConversation($("chat-body"), w.session, { edit: w.edit, stop: { ...w, depth: 1 }, tag: "wrote the deleted lines", add: textSet(r.text) });
+    showGapConversation($("chat-body"), r, w.session, { edit: w.edit, stop: { ...w, depth: 1 }, tag: "wrote the deleted lines" }, "add");
     return true;
   };
   box.replaceChildren(
@@ -2037,10 +2630,11 @@ const backLabel = () => (state.backTo.path === state.file?.path ? `Line ${state.
 
 async function backToLine() {
   const { path, line, focus } = state.backTo;
-  state.focus = focus;
-  if (state.file?.path !== path) return openFile(path, line);
-  renderFile();
-  renderSessions();
+  if (state.file?.path !== path) {
+    state.focus = focus;
+    return openFile(path, line);
+  }
+  setFocus(focus, { save: false });
   selectLine(line, { scroll: true });
 }
 
@@ -2063,6 +2657,7 @@ async function loadConversation(id) {
 
 async function showConversation(box, id, target) {
   const token = (showConversation.token = (showConversation.token || 0) + 1);
+  stopPinPrompt?.();
   if (!conversations.has(id)) box.replaceChildren(h("div", { class: "empty" }, "Loading the conversation…"));
   let conv;
   try {
@@ -2111,40 +2706,61 @@ const plainText = (text) =>
 
 // The bar under the session pins the prompt of the turn being read, but only
 // once that turn's own message has scrolled away, so it never shows twice.
+let stopPinPrompt = null;
+
 function pinPrompt(box, bar) {
   const pin = bar.querySelector(".prompt-pin");
-  if (!pin) return;
-  let turn = null;
+  const list = box.querySelector(".chat");
+  if (!pin || !list) return;
+  const turns = [...list.querySelectorAll(":scope > .turn")];
+  const bubbles = turns.map((turn) => turn.querySelector(":scope > .msg.user"));
+  const who = pin.querySelector(".who");
+  const text = pin.querySelector(".pin-text");
+  let current = -1;
+  let tops = null;
+  let frame = 0;
+
   const update = () => {
+    frame = 0;
+    const top = box.getBoundingClientRect().top - box.scrollTop;
     const edge = bar.getBoundingClientRect().bottom;
-    let current = null;
-    for (const t of box.querySelectorAll(".chat > .turn")) {
-      if (t.getBoundingClientRect().top >= edge) break;
-      current = t;
-    }
-    const bubble = current?.querySelector(":scope > .msg.user");
-    if (!bubble || bubble.getBoundingClientRect().bottom > edge + 4) {
-      pin.hidden = true;
-      turn = null;
-      return;
-    }
-    if (current !== turn) {
-      turn = current;
-      const user = current.userItem;
-      pin.querySelector(".who").textContent = user.origin === "task" ? "Task" : "You";
-      pin.querySelector(".pin-text").textContent = plainText(user.text);
+    tops ??= turns.map((turn) => turn.getBoundingClientRect().top - top);
+    const index = lowerBound(tops.length, (i) => tops[i] < edge - top) - 1;
+    const bubble = bubbles[index];
+    const next = bubble && bubble.getBoundingClientRect().bottom <= edge + 4 ? index : -1;
+    if (current === next) return;
+    current = next;
+    if (next >= 0) {
+      const user = turns[next].userItem;
+      who.textContent = user.origin === "task" ? "Task" : "You";
+      text.textContent = plainText(user.text);
       pin.title = "Go to this message";
     }
-    pin.hidden = false;
+    pin.hidden = next < 0;
   };
+  const queue = () => { if (!frame) frame = requestAnimationFrame(update); };
+  const invalidate = () => {
+    tops = null;
+    queue();
+  };
+  const observer = new ResizeObserver(invalidate);
+  observer.observe(list);
+  observer.observe(bar);
+  for (const turn of turns) observer.observe(turn);
   pin.onclick = () => {
-    if (!turn) return;
+    if (current < 0) return;
+    const turn = turns[current];
     if (turn.classList.contains("folded")) turn.querySelector(".fold").click();
-    turn.querySelector(":scope > .msg.user").scrollIntoView({ block: "start" });
+    bubbles[current].scrollIntoView({ block: "start" });
   };
-  // Scroll events already arrive at most once a frame.
-  box.onscroll = update;
-  update();
+  box.addEventListener("scroll", queue, { passive: true });
+  stopPinPrompt = () => {
+    cancelAnimationFrame(frame);
+    observer.disconnect();
+    box.removeEventListener("scroll", queue);
+    stopPinPrompt = null;
+  };
+  queue();
 }
 
 function sessionBar(conv, box) {
@@ -2763,6 +3379,7 @@ function bindTooltips() {
   let held = null;
   let timer = 0;
   let lastShown = 0;
+  let frame = 0;
 
   const label = (el) => (el.dataset.tip || el.getAttribute("title") || el.getAttribute("aria-label") || "").trim();
   const find = (node) => {
@@ -2773,7 +3390,8 @@ function bindTooltips() {
   const hide = () => {
     clearTimeout(timer);
     timer = 0;
-    if (!tip.hidden) lastShown = Date.now();
+    cancelAnimationFrame(frame);
+    if (!tip.hidden && tip.style.visibility !== "hidden") lastShown = Date.now();
     tip.hidden = true;
     if (owner && held != null && !owner.hasAttribute("title") && owner.isConnected) owner.setAttribute("title", held);
     owner = null;
@@ -2781,8 +3399,6 @@ function bindTooltips() {
   };
 
   const place = (el, at) => {
-    tip.style.left = "0px";
-    tip.style.top = "0px";
     const box = el.getBoundingClientRect();
     const w = tip.offsetWidth;
     const hgt = tip.offsetHeight;
@@ -2792,6 +3408,7 @@ function bindTooltips() {
     const below = box.bottom + 8 + hgt <= window.innerHeight - 4;
     tip.style.left = `${Math.round(left)}px`;
     tip.style.top = `${Math.round(below ? box.bottom + 8 : Math.max(4, box.top - 8 - hgt))}px`;
+    tip.style.visibility = "";
   };
 
   const arm = (el, at, instant) => {
@@ -2806,8 +3423,13 @@ function bindTooltips() {
       timer = 0;
       if (owner !== el || !el.isConnected) return hide();
       tip.textContent = words;
+      tip.style.left = tip.style.top = "0px";
+      tip.style.visibility = "hidden";
       tip.hidden = false;
-      place(el, at);
+      // Let the hidden tip get its layout before reading it in the next frame.
+      frame = requestAnimationFrame(() => {
+        frame = requestAnimationFrame(() => el.isConnected ? place(el, at) : hide());
+      });
     };
     if (instant || Date.now() - lastShown < WARM_MS) go();
     else timer = setTimeout(go, SHOW_DELAY);
@@ -2835,12 +3457,78 @@ function bindTooltips() {
   window.addEventListener("resize", hide);
 }
 
+let clearCodeHover = null;
+
+function bindCodeHover() {
+  const list = $("lines");
+  const hover = $("hover");
+  let row = null, paintedRow = null, point = null, hit = null, rect = null;
+  let frame = 0;
+  const sameWord = (a, b) => a?.node === b?.node && a?.start === b?.start && a?.end === b?.end;
+  const inside = (r, p) => r && r.left <= p.x && p.x < r.right && r.top <= p.y && p.y < r.bottom;
+  const update = () => {
+    frame = 0;
+    const current = row?.isConnected ? row : null;
+    const next = point && current
+      ? hit?.node.isConnected && inside(rect, point) ? hit : nameAt(point.x, point.y)
+      : null;
+    const changed = !sameWord(hit, next);
+    if (next && (changed || !rect)) {
+      const range = new Range();
+      range.setStart(next.node, next.start);
+      range.setEnd(next.node, next.end);
+      rect = range.getBoundingClientRect();
+    } else if (!next) rect = null;
+
+    if (current !== paintedRow) {
+      paintedRow = current;
+      const data = current?.dataset;
+      hover.replaceChildren(...(data?.line ? describeOwner(Number(data.line)) : data?.after != null ? describeGap(Number(data.after)) : []));
+    }
+    if (changed) {
+      hit = next;
+      list.classList.toggle("linking", !!hit);
+      markLink(hit);
+    }
+  };
+  const queue = () => { if (!frame) frame = requestAnimationFrame(update); };
+  const move = (e) => {
+    const next = e.target.closest(".ln, .gap");
+    const link = (e.metaKey || e.ctrlKey) && next?.matches(".ln");
+    if (next === row && !link && !point) return;
+    row = next;
+    point = link ? { x: e.clientX, y: e.clientY } : null;
+    queue();
+  };
+  const unlink = () => {
+    point = null;
+    queue();
+  };
+  clearCodeHover = () => {
+    row = null;
+    unlink();
+  };
+  list.addEventListener("mouseover", move);
+  list.addEventListener("mousemove", move);
+  list.addEventListener("mouseleave", clearCodeHover);
+  document.addEventListener("keyup", (e) => (e.key === "Meta" || e.key === "Control") && unlink());
+  window.addEventListener("blur", clearCodeHover);
+  const moved = () => {
+    rect = null;
+    if (point) unlink();
+    else if (row && !row.isConnected) clearCodeHover();
+  };
+  window.addEventListener("scroll", moved, true);
+  window.addEventListener("resize", moved);
+}
+
 function bindEvents() {
   bindTooltips();
+  $("code-scroll").addEventListener("scroll", queueFileRows, { passive: true });
   $("lines").addEventListener("click", (e) => {
     const link = (e.metaKey || e.ctrlKey) && nameAt(e.clientX, e.clientY);
     if (link) {
-      markLink(null);
+      clearCodeHover?.();
       // The line clicked from becomes the place Back returns to.
       selectLine(link.line);
       return showUses(link.name, { path: state.file.path, line: link.line });
@@ -2853,27 +3541,8 @@ function bindEvents() {
     if (e.target.closest(".gap-mark")) toggleGap(after);
     selectGap(after);
   });
-  $("lines").addEventListener("mouseover", (e) => {
-    const row = e.target.closest(".ln");
-    if (row) return $("hover").replaceChildren(...describeOwner(Number(row.dataset.line)));
-    const gap = e.target.closest(".gap");
-    if (gap) $("hover").replaceChildren(...describeGap(Number(gap.dataset.after)));
-  });
+  bindCodeHover();
   $("gaps-toggle").addEventListener("click", toggleAllGaps);
-  // Holding the modifier turns names into links.
-  $("lines").addEventListener("mousemove", (e) => {
-    const hit = (e.metaKey || e.ctrlKey) && nameAt(e.clientX, e.clientY);
-    $("lines").classList.toggle("linking", !!hit);
-    markLink(hit || null);
-  });
-  const unlink = () => {
-    $("lines").classList.remove("linking");
-    markLink(null);
-  };
-  $("lines").addEventListener("mouseleave", unlink);
-  document.addEventListener("keyup", (e) => (e.key === "Meta" || e.key === "Control") && unlink());
-  window.addEventListener("blur", unlink);
-  $("lines").addEventListener("mouseleave", () => $("hover").replaceChildren());
   $("code-scroll").addEventListener("keydown", (e) => {
     if (!state.file?.lines) return;
     // From a deletion, the arrows step to the line below or above it.
@@ -2937,8 +3606,7 @@ function bindEvents() {
   $("find-next").addEventListener("click", () => stepFind(1));
   $("find-close").addEventListener("click", closeFind);
   $("find-case").addEventListener("click", () => {
-    setFind(find.query, !find.case);
-    if (find.hits.length) $(`L${find.hits[nearestHit(1)].line}`)?.scrollIntoView({ block: "center" });
+    setFind($("find-input").value, !find.case);
   });
 
   const drawer = $("cypher");
@@ -3264,7 +3932,8 @@ function closeMenu() {
 /* ---------- Folders ---------- */
 
 function resetWorkspace() {
-  Object.assign(state, { overview: null, tree: null, entries: [], root: "", tabs: [], file: null, line: null, focus: null, byLine: [], cypher: [] });
+  outlines.clear();
+  Object.assign(state, { overview: null, tree: null, entries: [], root: "", tabs: [], file: null, line: null, focus: null, cypher: [] });
   state.sessions.clear();
   state.expanded.clear();
   state.folded.clear();
@@ -3805,7 +4474,7 @@ function bindWorkspaceEvents() {
     else if (e.ctrlKey && !e.metaKey && !e.altKey && (key === "-" || key === "_")) e.shiftKey ? !$("nav-forward").disabled && history.forward() : !$("nav-back").disabled && history.back();
     else if (mod && e.shiftKey && !e.altKey && key === "f") openSearch();
     else if (mod && !e.shiftKey && !e.altKey && key === "f" && (state.file?.lines || $("chat-find"))) ((lastArea === "chat" || !state.file?.lines) && openChatFind()) || openFind();
-    else if (e.metaKey && !e.ctrlKey && key === "g" && find.hits.length) stepFind(e.shiftKey ? -1 : 1);
+    else if (e.metaKey && !e.ctrlKey && key === "g" && (find.pending || find.hits.length)) stepFind(e.shiftKey ? -1 : 1);
     else if (e.key === "Escape" && !$("file-menu").hidden) closeMenu();
     else return;
     e.preventDefault();

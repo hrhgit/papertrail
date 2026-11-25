@@ -335,17 +335,22 @@ const SYNTAX = (() => {
     return out;
   }
 
-  // One token list per line, or null when the file's language isn't known.
-  function tokens(lines, path) {
-    const lang = language(path, lines[0]);
+  // Keep the lexical state across lines and across slices of the same file.
+  function scanner(lang) {
     if (!lang) return null;
     const st = {};
     const scan = lang === "markup" ? (t) => scanMarkup(t, st) : lang === "markdown" ? (t) => scanMarkdown(t, st) : (t) => scanCode(t, LANGS[lang], st);
     // A minified line is not worth the time, and nobody reads it for its colors.
-    return lines.map((text) => (text.length > 2000 ? [] : scan(text)));
+    return (text) => text.length > 2000 ? [] : scan(text);
   }
 
-  return { tokens, language, TYPES: ["comment", "string", "keyword", "const", "number", "def", "call", "prop", "tag", "meta"] };
+  // One token list per line, or null when the file's language isn't known.
+  function tokens(lines, path) {
+    const scan = scanner(language(path, lines[0]));
+    return scan ? lines.map(scan) : null;
+  }
+
+  return { tokens, scanner, language, TYPES: ["comment", "string", "keyword", "const", "number", "def", "call", "prop", "tag", "meta"] };
 })();
 
 if (typeof module !== "undefined") module.exports = SYNTAX;
