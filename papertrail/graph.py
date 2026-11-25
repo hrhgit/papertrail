@@ -1,12 +1,13 @@
 """Build and verify a private generation before publishing the single-file graph."""
 
-import hashlib
 import os
+import pickle
 from collections import defaultdict
+from contextlib import ExitStack
 from dataclasses import asdict, replace
 from itertools import pairwise
 from pathlib import Path
-from tempfile import TemporaryDirectory
+from tempfile import TemporaryDirectory, TemporaryFile
 
 import relate
 
@@ -100,8 +101,63 @@ def build(store, sessions, stage=None, portable=None):
     ignore = store.parent / ".gitignore"
     if store.parent.name == ".papertrail" and not ignore.exists():
         ignore.write_text("*\n")
-    nodes, edges = defaultdict(list), defaultdict(list)
+    store = store.resolve()
+    meta = {"version": 1}
+    base = str(Path(portable).resolve()) if portable else None
+    if base:
+        meta["portable"] = os.path.relpath(base, store.parent)
+    with TemporaryDirectory(prefix=".papertrail-build-", dir=store.parent) as tmp, ExitStack() as spill:
+        def batches():
+            return RowBatches(tmp, spill, base)
 
+        nodes, edges = defaultdict(batches), defaultdict(batches)
+        edit_rows, unplaced = collect_rows(sessions, nodes, edges, stage)
+        if base:
+            unplaced = {swap(key, base, ROOT) for key in unplaced}
+        if stage:
+            stage("write", files=nodes["File"].count)
+        staged = Path(tmp) / "graph.rl"
+        staged.touch(mode=0o600)
+        with relate.connect(str(staged)) as db:
+            db.autocommit = True
+            db.execute("CREATE (m:PaperTrail) SET m = $meta", {"meta": meta})
+            for label, rows in nodes.items():
+                db.execute(
+                    f"CREATE CONSTRAINT IF NOT EXISTS FOR (n:{label}) REQUIRE n.id IS UNIQUE"
+                )
+                for batch in rows.batches():
+                    if rows is edit_rows and unplaced:
+                        for row in batch:
+                            if row["id"] in unplaced:
+                                row["unplaced"] = True
+                    write_rows(db, f"UNWIND $rows AS row CREATE (n:{label}) SET n = row", batch)
+            for (a, kind, b), rows in edges.items():
+                query = (
+                    f"UNWIND $rows AS row MATCH (a:{a} {{id:row.a}}), (b:{b} {{id:row.b}}) "
+                    f"CREATE (a)-[r:{kind}]->(b) SET r = row.props"
+                )
+                for batch in rows.batches():
+                    write_rows(db, query, batch, kind)
+        try:
+            os.link(staged, store)
+        except FileExistsError:
+            # Pin the previous generation read-only while checking its identity.
+            # An active Relate writer prevents opening it. Existing readers
+            # keep their old inode until they reopen the published generation.
+            with relate.connect(str(store), read_only=True) as previous:
+                if (
+                    previous.execute("MATCH (n) RETURN count(n) AS n").data()[0]["n"]
+                    and not previous.execute(
+                        "MATCH (:PaperTrail {version:1}) RETURN 1 AS ok"
+                    ).data()
+                ):
+                    raise ValueError(
+                        "Existing store belongs to another application. Choose a fresh --store."
+                    )
+                os.replace(staged, store)
+
+
+def collect_rows(sessions, nodes, edges, stage):
     def link(a, kind, b, left, right, **attrs):
         edges[a, kind, b].append({"a": left, "b": right, "props": attrs})
 
@@ -137,19 +193,18 @@ def build(store, sessions, stage=None, portable=None):
             link("Edit", "TOUCHED", "File", e.id, e.path)
         for a, b in pairwise(ordered):
             link("Edit", "NEXT", "Edit", a.id, b.id)
-    edit_nodes = {row["id"]: row for row in nodes["Edit"]}
+    edit_rows, unplaced = nodes["Edit"], set()
     if stage:
         stage("replay")
     for f in histories(sessions):
-        for key in f.unplaced_edits:
-            edit_nodes[key]["unplaced"] = True
+        unplaced.update(f.unplaced_edits)
         nodes["File"].append(
             {
                 "id": f.path,
                 "path": f.path,
                 "status": f.status,
                 "lines": f.lines,
-                "sha": digest(f.path) if f.status in ("exact", "drift", "unresolved") else "",
+                "sha": f.sha,
                 "unapplied": f.unapplied,
                 "external_events": f.external_events,
             }
@@ -177,57 +232,55 @@ def build(store, sessions, stage=None, portable=None):
             nodes["Gap"].append({"id": key, "after": after})
             link("File", "HAS_GAP", "Gap", f.path, key)
             link("Gap", "FROM", "Hunk", key, origin)
-    if stage:
-        stage("write", files=len(nodes["File"]))
-    store = store.resolve()
-    meta = {"version": 1}
-    if portable:
-        base = Path(portable).resolve()
-        meta["portable"] = os.path.relpath(base, store.parent)
-        for rows in (*nodes.values(), *edges.values()):
-            rows[:] = swap(rows, str(base), ROOT)
-    with TemporaryDirectory(prefix=".papertrail-build-", dir=store.parent) as tmp:
-        staged = Path(tmp) / "graph.rl"
-        staged.touch(mode=0o600)
-        with relate.connect(str(staged)) as db:
-            db.autocommit = True
-            db.execute("CREATE (m:PaperTrail) SET m = $meta", {"meta": meta})
-            for label, rows in nodes.items():
-                db.execute(
-                    f"CREATE CONSTRAINT IF NOT EXISTS FOR (n:{label}) REQUIRE n.id IS UNIQUE"
-                )
-                write_rows(db, f"UNWIND $rows AS row CREATE (n:{label}) SET n = row", rows)
-            for (a, kind, b), rows in edges.items():
-                query = (
-                    f"UNWIND $rows AS row MATCH (a:{a} {{id:row.a}}), (b:{b} {{id:row.b}}) "
-                    f"CREATE (a)-[r:{kind}]->(b) SET r = row.props"
-                )
-                write_rows(db, query, rows, kind)
-        try:
-            os.link(staged, store)
-        except FileExistsError:
-            # Pin the previous generation read-only while checking its identity.
-            # An active Relate writer prevents opening it. Existing readers
-            # keep their old inode until they reopen the published generation.
-            with relate.connect(str(store), read_only=True) as previous:
-                if (
-                    previous.execute("MATCH (n) RETURN count(n) AS n").data()[0]["n"]
-                    and not previous.execute(
-                        "MATCH (:PaperTrail {version:1}) RETURN 1 AS ok"
-                    ).data()
-                ):
-                    raise ValueError(
-                        "Existing store belongs to another application. Choose a fresh --store."
-                    )
-                os.replace(staged, store)
+    return edit_rows, unplaced
 
 
-def digest(path):
-    """Identity of the file ingest compared against, so a query can tell it has changed."""
-    try:
-        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
-    except OSError:
-        return ""
+# Leave room for Relate's WAL overhead. The exact limit is enforced by write_rows.
+BATCH_BYTES = 8 * 1024 * 1024
+
+
+def estimated_bytes(value):
+    if isinstance(value, str):
+        return 8 + len(value) * (1 if value.isascii() else 4)
+    if isinstance(value, dict):
+        return 16 + sum(estimated_bytes(k) + estimated_bytes(v) for k, v in value.items())
+    if isinstance(value, list):
+        return 16 + sum(map(estimated_bytes, value))
+    return 16
+
+
+class RowBatches:
+    """Buffer one batch per row type and spill full batches into the private build directory."""
+
+    def __init__(self, directory, files, base):
+        self.directory = directory
+        self.files = files
+        self.base = base
+        self.pending = []
+        self.size = self.count = self.spilled = 0
+        self.spool = None
+
+    def append(self, row):
+        if self.base:
+            row = swap(row, self.base, ROOT)
+        size = estimated_bytes(row)
+        if self.pending and self.size + size > BATCH_BYTES:
+            if self.spool is None:
+                self.spool = self.files.enter_context(TemporaryFile(dir=self.directory))
+            pickle.dump(self.pending, self.spool, protocol=pickle.HIGHEST_PROTOCOL)
+            self.spilled += 1
+            self.pending = []
+            self.size = 0
+        self.pending.append(row)
+        self.size += size
+        self.count += 1
+
+    def batches(self):
+        if self.spool is not None:
+            self.spool.seek(0)
+            for _ in range(self.spilled):
+                yield pickle.load(self.spool)
+        yield self.pending
 
 
 def write_rows(db, query, rows, relationship=None):

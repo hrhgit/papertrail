@@ -1,10 +1,11 @@
 """Replay one path at a time. Each operation uses pre-change line coordinates."""
 
+import hashlib
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from difflib import SequenceMatcher
-from itertools import groupby, islice, tee
+from itertools import groupby, tee
 from pathlib import Path
 from stat import S_ISREG
 
@@ -42,6 +43,14 @@ class FileHistory:
     reasons: Counter = field(default_factory=Counter)
     unplaced_edits: set = field(default_factory=set)
     unknown_reasons: dict = field(default_factory=dict)
+    sha: str = field(default="", repr=False, compare=False)
+
+
+@dataclass
+class DiskImage:
+    status: str
+    rows: list[str] | None
+    sha: str = ""
 
 
 def unique_block(rows, index, pos, size):
@@ -71,19 +80,77 @@ def anchors(old, new):
             yield i, j, n
 
 
-def carry(marks, moves):
-    """Map marks through aligned spans. Inside a rewritten span a mark has no spot left."""
-    kept = []
-    for pos, owner in marks:
-        for old_start, old_end, new_start, new_end, matched in moves:
-            if not old_start <= pos <= old_end:
+class DeletionPoints:
+    """Store marks in the gaps between rows, keeping their original creation order."""
+
+    def __init__(self):
+        self.slots = []
+        self.next_order = 0
+
+    def add(self, pos, owner, row_count):
+        if not self.slots:
+            self.slots = [None] * (row_count + 1)
+        if self.slots[pos] is None:
+            self.slots[pos] = []
+        self.slots[pos].append((self.next_order, owner))
+        self.next_order += 1
+
+    def pad(self, extra):
+        if self.slots:
+            self.slots.extend([None] * extra)
+
+    def splice(self, start, end, size):
+        if not self.slots:
+            return
+        if start == end:
+            # An insertion leaves the mark at its starting boundary in place.
+            self.slots[start + 1 : start + 1] = [None] * size
+        elif size:
+            self.slots[start + 1 : end] = [None] * (size - 1)
+        else:
+            # A deletion joins both boundaries and all the gaps between them.
+            buckets = [bucket for bucket in self.slots[start : end + 1] if bucket]
+            if buckets:
+                merged = max(buckets, key=len)
+                for bucket in buckets:
+                    if bucket is not merged:
+                        merged.extend(bucket)
+                self.slots[start] = merged
+            del self.slots[start + 1 : end + 1]
+
+    def align(self, moves, row_count):
+        """Carry marks through the first aligned span covering each gap."""
+        if not self.slots:
+            return
+        kept = [None] * (row_count + 1)
+        span = 0
+        for pos, bucket in enumerate(self.slots):
+            if not bucket:
                 continue
+            while moves[span][1] < pos:
+                span += 1
+            old_start, old_end, new_start, new_end, matched = moves[span]
             if matched or pos == old_start:
-                kept.append((new_start + pos - old_start, owner))
+                at = new_start + pos - old_start
             elif pos == old_end or new_start == new_end:
-                kept.append((new_end if pos == old_end else new_start, owner))
-            break
-    return kept
+                at = new_end
+            else:
+                continue
+            if kept[at] is None:
+                kept[at] = bucket
+            else:
+                kept[at].extend(bucket)
+        self.slots = kept
+
+    def ordered(self):
+        return [
+            (pos, owner)
+            for _, pos, owner in sorted(
+                (order, pos, owner)
+                for pos, bucket in enumerate(self.slots) if bucket
+                for order, owner in bucket
+            )
+        ]
 
 
 class State:
@@ -97,7 +164,7 @@ class State:
         self.file = FileHistory(path)
         self.rows = []
         self.owners = []
-        self.marks = []
+        self.marks = DeletionPoints()
         self.known_owners = set()
         self.open_tail = True
         self.edited = False
@@ -145,27 +212,14 @@ class State:
                 i if i < start else i + delta for i in self.soft_endings if i < start or i >= end
             }
         if not fill:
-            self.move_marks(start, end, len(added))
+            self.marks.splice(start, end, len(added))
         self.rows[start:end] = added
         self.owners[start:end] = [owner] * len(added)
         if end > start and not added:
-            self.marks.append((start, owner))
-
-    def move_marks(self, start, end, size):
-        """Carry marks across rows[start:end] becoming `size` new rows."""
-        kept = []
-        for pos, owner in self.marks:
-            if pos <= start:
-                kept.append((pos, owner))
-            elif pos >= end:
-                kept.append((pos + size - (end - start), owner))
-            elif not size:
-                # Deleting the rows around a mark joins it to the new deletion.
-                kept.append((start, owner))
-        self.marks = kept
+            self.marks.add(start, owner, len(self.rows))
 
     def forget(self, first, end, count):
-        self.move_marks(first, end, count)
+        self.marks.splice(first, end, count)
         self.rows[first:end] = [None] * count
         self.owners[first:end] = [None] * count
         self.soft_endings = {
@@ -178,6 +232,7 @@ class State:
         extra = max(0, count - len(self.rows))
         self.rows.extend([None] * extra)
         self.owners.extend([None] * extra)
+        self.marks.pad(extra)
 
     def reveal(self, start, observed, ts):
         """Apply an observation at a known address, preserving the owner of equal lines."""
@@ -333,7 +388,9 @@ class State:
                     deletions.append((b, self.hunk(kind, ts, [], owners[a:i], edit, False, old[a:i])))
             assigned.extend(owners[i : i + n])
             a, b = i + n, j + n
-        self.marks = [*carry(self.marks, moves), *deletions]
+        self.marks.align(moves, len(target))
+        for pos, owner in deletions:
+            self.marks.add(pos, owner, len(target))
         self.rows, self.owners = target.copy(), assigned
         self.open_tail = False
         self.observed = True
@@ -380,7 +437,8 @@ def later_context(state, edit, parts, following, disk):
             for part, pos in positions(image, parts, postimage=True):
                 after = [t for sign, t in part.ops if sign != "-"]
                 if not after or any(
-                    state.rows[i : i + len(after)] == after for i in range(len(state.rows))
+                    row == after[0] and state.rows[i : i + len(after)] == after
+                    for i, row in enumerate(state.rows)
                 ):
                     raise ValueError
                 first = pos - delta
@@ -456,11 +514,15 @@ def disk_image(path):
         location = Path(path)
         if not S_ISREG(location.stat().st_mode):
             raise OSError()
-        return "", lines(location.read_bytes().decode("utf-8"))
+        raw = location.read_bytes()
+        text = raw.decode("utf-8")
+        sha = hashlib.sha256(raw).hexdigest()
+        del raw
+        return DiskImage("", lines(text), sha)
     except FileNotFoundError:
-        return "missing", None
+        return DiskImage("missing", None)
     except (OSError, UnicodeError):
-        return "unreadable", None
+        return DiskImage("unreadable", None)
 
 
 def append_output(state, edit, following, disk):
@@ -559,7 +621,8 @@ def apply_event(state, event, following, disk):
 
 def finish(state, snapshot):
     f = state.file
-    f.status, disk = snapshot
+    f.status, f.sha = snapshot.status, snapshot.sha
+    disk = snapshot.rows
     if disk is None:
         return f
     complete = not state.open_tail and None not in state.rows
@@ -575,7 +638,7 @@ def finish(state, snapshot):
         end = start + sum(1 for _ in group)
         f.ranges.append((start, end - 1, owner))
         start = end
-    f.gaps = list(state.marks)
+    f.gaps = state.marks.ordered()
     return f
 
 
@@ -590,6 +653,11 @@ def replay(path, edits, reads=()):
     states = {path: state}
     replay_component(states, events, {path: disk})
     return finish(states[path], disk)
+
+
+def following_events(segment, idx):
+    for i in range(idx + 1, len(segment)):
+        yield segment[i]
 
 
 def replay_component(states, events, disks):
@@ -626,8 +694,8 @@ def replay_component(states, events, disks):
         elif op == "add":
             reset(path)
         segment, idx = locations[id(event)]
-        disk = disks[path][1] if segment is intervals[path][-1] else None
-        apply_event(states[path], event, islice(segment, idx + 1, None), disk)
+        disk = disks[path].rows if segment is intervals[path][-1] else None
+        apply_event(states[path], event, following_events(segment, idx), disk)
 
 
 def histories(sessions):

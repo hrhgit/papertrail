@@ -141,6 +141,7 @@ class Rollout:
         self.shell_receipts = {}
         self.patch_starts = {}
         self.closed = {}
+        self.closed_at = defaultdict(dict)
         self.outputs = {}
         self.native_turns = set()
         self.prompt_info = {}
@@ -198,11 +199,9 @@ class Rollout:
         if changes:
             # A delayed nested receipt may use an item ID that differs from the
             # call ID. Only reconcile an adjacent closed call with matching data.
-            eligible.extend(
-                c
-                for k, c in self.closed.items()
-                if self.outputs[k][0] == self.seq - 1 and c.turn.turn_id == turn_id
-            )
+            adjacent = self.closed_at.get((self.seq - 1, turn_id))
+            if adjacent:
+                eligible.extend(adjacent.values())
             matches = []
             for candidate in eligible:
                 if candidate.patch:
@@ -536,12 +535,19 @@ class Rollout:
             return
         # Some rollouts serialize the tool output before the completed event.
         # Defer fallback until both streams have been consumed.
+        if key in self.closed:
+            previous = self.outputs[key][0], self.closed[key].turn.turn_id
+            bucket = self.closed_at[previous]
+            del bucket[key]
+            if not bucket:
+                del self.closed_at[previous]
         self.closed[key] = call
         self.outputs[key] = (
             self.seq,
             ts,
             output_status(p.get("output"), "exec_command" if call.shell else call.name),
         )
+        self.closed_at[self.seq, call.turn.turn_id][key] = call
 
     def settle(self, call, ts, status):
         if call.command and not call.command_events and not call.patch:

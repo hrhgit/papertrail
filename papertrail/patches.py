@@ -1,8 +1,11 @@
 """Decode a single file's patch into old-file coordinates and literal line operations."""
 
 import re
+from bisect import bisect_left, bisect_right
+from collections import defaultdict
 from dataclasses import dataclass
 from difflib import SequenceMatcher
+from functools import lru_cache
 from itertools import groupby
 
 
@@ -32,6 +35,12 @@ class Section:
 
 
 def sections(patch):
+    # Hand each caller its own mutable sections and operation lists.
+    return [Section(start, list(ops), scope, eof) for start, ops, scope, eof in _parse_sections(patch)]
+
+
+@lru_cache(maxsize=256)
+def _parse_sections(patch):
     raw_sections = []
     for raw in lines(patch):
         line = raw.removesuffix("\n")
@@ -70,20 +79,21 @@ def sections(patch):
         elif title.startswith("@@ -"):
             raise ValueError("Invalid patch header.")
         result.append(
-            Section(
+            (
                 pos,
-                ops,
+                tuple(ops),
                 title.removeprefix("@@").removeprefix(" ") if not m else "",
                 eof,
             )
         )
     if not result:
         raise ValueError("Missing patch hunk header.")
-    return result
+    return tuple(result)
 
 
 def positions(old, parts, open_tail=False, postimage=False):
     cursor = 0
+    first_lines = None
     for section in parts:
         pos = section.start
         context = [t for sign, t in section.ops if sign != "-"] if postimage else section.before
@@ -104,15 +114,23 @@ def positions(old, parts, open_tail=False, postimage=False):
             or pos > len(old)
             or old[pos : pos + len(context)] != context
         ):
-            candidates = [
-                i
-                for i in range(cursor, len(old) - len(context) + 1)
-                if old[i : i + len(context)] == context
-                and (not section.eof or (not open_tail and i + len(context) == len(old)))
-            ]
-            if len(candidates) != 1:
+            last = len(old) - len(context)
+            if section.eof:
+                candidates = (last,) if not open_tail and last >= cursor else ()
+            elif context:
+                if first_lines is None:
+                    first_lines = defaultdict(list)
+                    for i, row in enumerate(old):
+                        first_lines[row].append(i)
+                hits = first_lines.get(context[0], ())
+                start, stop = bisect_left(hits, cursor), bisect_right(hits, last)
+                candidates = (hits[i] for i in range(start, stop))
+            else:
+                candidates = range(cursor, last + 1)
+            matches = (i for i in candidates if old[i : i + len(context)] == context)
+            pos = next(matches, None)
+            if pos is None or next(matches, None) is not None:
                 raise ValueError("Patch context missing or ambiguous.")
-            pos = candidates[0]
         yield section, pos
         cursor = pos + len(context)
 
@@ -121,6 +139,20 @@ def patch_changes(old, patch, open_tail=False):
     return [
         op for part, pos in positions(old, sections(patch), open_tail) for op in part.changes(pos)
     ]
+
+
+def shared_block(a, b):
+    """An identical block containing every shared line must be the unique longest match."""
+    common = set(a).intersection(b)
+    if common:
+        i = next(i for i, row in enumerate(a) if row in common)
+        j = next(j for j, row in enumerate(b) if row in common)
+        end_a = next(k for k in range(len(a), i, -1) if a[k - 1] in common)
+        end_b = next(k for k in range(len(b), j, -1) if b[k - 1] in common)
+        # Exclude internal lines that could match outside an otherwise equal block.
+        if end_a - i == end_b - j and a[i:end_a] == b[j:end_b]:
+            return i, end_a, j, end_b
+    return None
 
 
 def changes(old, new):
@@ -132,6 +164,14 @@ def changes(old, new):
     while tail < end - start and old[-1 - tail] == new[-1 - tail]:
         tail += 1
     a, b = old[start : len(old) - tail], new[start : len(new) - tail]
+    block = shared_block(a, b)
+    if block is not None:
+        i, j, k, l = block
+        if i or k:
+            yield start, start + i, b[:k]
+        if j < len(a) or l < len(b):
+            yield start + j, start + len(a), b[l:]
+        return
     for tag, i, j, k, l in SequenceMatcher(None, a, b, autojunk=False).get_opcodes():
         if tag != "equal":
             yield start + i, start + j, b[k:l]
