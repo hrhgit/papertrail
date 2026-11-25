@@ -1,0 +1,8 @@
+.venv/
+.uv-cache/
+.papertrail/
+.pytest_cache/
+__pycache__/
+*.egg-info/
+*.rl
+*.rl.*

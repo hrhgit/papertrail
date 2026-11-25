@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="papertrail-version" content="__PAPER_TRAIL_VERSION__">
+<title>Paper Trail</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M6 4v24' stroke='%23D7352B' stroke-width='5'/%3E%3Cpath d='M14 4v10q0 4 -4 6l-4 2' stroke='%231F6FD1' stroke-width='5' fill='none'/%3E%3Ccircle cx='6' cy='24' r='4' fill='white' stroke='%2319202A' stroke-width='2.5'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header class="bar">
+  <a class="mark" href="#" aria-label="Paper Trail home">
+    <svg viewBox="0 0 44 24" aria-hidden="true">
+      <path d="M2 18h40" class="m1"/>
+      <path d="M2 6h14q6 0 10 6t10 6h6" class="m2"/>
+      <circle cx="30" cy="18" r="4.2" class="hub"/>
+    </svg>
+    <span>Paper Trail</span>
+  </a>
+  <div class="menu">
+    <button type="button" class="menu-button" id="file-menu-button" aria-haspopup="menu" aria-expanded="false" aria-controls="file-menu">File</button>
+    <div class="menu-list" id="file-menu" role="menu" aria-labelledby="file-menu-button" hidden></div>
+  </div>
+  <div class="nav-btns">
+    <button type="button" id="nav-back" class="icon-btn bare" disabled title="Back"></button>
+    <button type="button" id="nav-forward" class="icon-btn bare" disabled title="Forward"></button>
+  </div>
+  <p class="summary" id="summary"></p>
+  <div class="tools">
+    <button type="button" id="cypher-toggle" aria-pressed="false" title="The Cypher behind this view">Cypher</button>
+    <button type="button" id="theme-toggle" class="icon-btn" title="Switch theme"></button>
+  </div>
+</header>
+
+<main class="layout">
+  <nav class="side" aria-label="Browse the graph">
+    <div class="tabs" role="tablist">
+      <button role="tab" data-tab="files" aria-selected="true" title="Browse the project's files">Files</button>
+      <button role="tab" data-tab="crossings" aria-selected="false" title="Lines rewritten by more than one session">Crossings</button>
+      <button role="tab" data-tab="sessions" aria-selected="false" title="Every agent session that touched this project">Sessions</button>
+      <button role="tab" data-tab="outline" aria-selected="false" class="tab-icon" id="outline-tab" aria-label="Outline"></button>
+      <button role="tab" data-tab="search" aria-selected="false" class="tab-icon" id="search-tab" aria-label="Search"></button>
+    </div>
+    <div class="tab-body" id="tab-files" role="tabpanel"></div>
+    <div class="tab-body" id="tab-crossings" role="tabpanel" hidden></div>
+    <div class="tab-body" id="tab-sessions" role="tabpanel" hidden></div>
+    <div class="tab-body" id="tab-outline" role="tabpanel" hidden></div>
+    <div class="tab-body" id="tab-search" role="tabpanel" hidden>
+      <div class="search-box">
+        <input id="search-input" type="text" autocomplete="off" spellcheck="false" placeholder="Search" aria-label="Search lines, instructions and deleted lines">
+        <button type="button" id="search-case" class="case-btn" aria-pressed="false" title="Match case" aria-label="Match case">Aa</button>
+      </div>
+      <div id="search-results"></div>
+    </div>
+    <ul class="legend" aria-label="Legend">
+      <li title="Each colored track is one agent session"><i class="key k-session"></i>Session</li>
+      <li title="Several sessions rewrote this spot; the newest is outermost"><i class="key k-crossing"></i>Crossing</li>
+      <li title="In the file before the first recorded session"><i class="key k-baseline"></i>Pre-existing</li>
+      <li title="Changed outside the agents, between two recorded edits"><i class="key k-external"></i>External edit</li>
+      <li title="Changed on disk after the last recorded edit"><i class="key k-drift"></i>Changed since</li>
+      <li title="Not enough evidence in the logs"><i class="key k-unknown"></i>Unknown</li>
+      <li title="Lines were deleted between these two lines. Click the mark to show them."><i class="key k-gap"></i>Deleted</li>
+    </ul>
+  </nav>
+
+  <section class="code" aria-label="File">
+    <div class="grip grip-side" id="grip-side" role="separator" aria-orientation="vertical" aria-label="Resize the sidebar" title="Drag to resize. Double-click to reset."></div>
+    <div class="grip grip-panel" id="grip-panel" role="separator" aria-orientation="vertical" aria-label="Resize the history panel" title="Drag to resize. Double-click to reset."></div>
+    <div class="editor-tabs" id="editor-tabs" role="tablist" aria-label="Open files" hidden></div>
+    <div class="code-head">
+      <div class="title-row">
+        <h1 id="file-title"></h1>
+        <button type="button" id="gaps-toggle" class="gaps-toggle" aria-pressed="false" hidden></button>
+      </div>
+      <div class="find" id="find" role="search" hidden>
+        <input id="find-input" type="text" autocomplete="off" spellcheck="false" placeholder="Find in file" aria-label="Find in file">
+        <span class="find-count" id="find-count" aria-live="polite"></span>
+        <button type="button" id="find-case" class="case-btn" aria-pressed="false" title="Match case" aria-label="Match case">Aa</button>
+        <button type="button" id="find-prev" class="icon-btn bare" title="Previous match (Shift+Enter)" aria-label="Previous match"></button>
+        <button type="button" id="find-next" class="icon-btn bare" title="Next match (Enter)" aria-label="Next match"></button>
+        <button type="button" id="find-close" class="icon-btn bare" title="Close (Esc)" aria-label="Close find"></button>
+      </div>
+      <div class="focus" id="focus" hidden></div>
+      <p class="note" id="file-note" hidden></p>
+      <p class="hover" id="hover" aria-live="polite"></p>
+    </div>
+    <div class="code-scroll" id="code-scroll" tabindex="0" aria-label="File lines. Use the arrow keys to move between lines.">
+      <div class="empty" id="code-empty"></div>
+      <ol class="lines" id="lines"></ol>
+    </div>
+  </section>
+
+  <aside class="panel" id="panel" aria-label="Line history" aria-live="polite">
+    <div class="empty">Click a line to see its history.</div>
+  </aside>
+</main>
+
+<section class="cypher" id="cypher" hidden aria-label="Cypher statements">
+  <div class="cypher-head">
+    <h2>Cypher</h2>
+    <p>Relate · read-only</p>
+    <button type="button" id="cypher-close" class="icon-btn bare" title="Hide" aria-label="Hide Cypher"></button>
+  </div>
+  <div class="cypher-body" id="cypher-body"></div>
+</section>
+
+<div class="server-notice" id="server-notice" hidden>
+  <span id="server-notice-text" role="status"></span>
+  <button type="button" id="server-reload">Reload</button>
+</div>
+
+<div class="palette-backdrop" id="palette" hidden>
+  <div class="palette" role="dialog" aria-modal="true">
+    <input id="palette-input" type="text" autocomplete="off" spellcheck="false" role="combobox" aria-expanded="true" aria-controls="palette-list" aria-autocomplete="list">
+    <ul class="palette-list" id="palette-list" role="listbox"></ul>
+  </div>
+</div>
+
+<div class="toast" id="toast" role="status" hidden></div>
+<script src="syntax.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

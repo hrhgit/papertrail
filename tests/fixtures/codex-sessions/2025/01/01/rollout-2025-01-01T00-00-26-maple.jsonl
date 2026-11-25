@@ -1,0 +1,5 @@
+{"timestamp": "2025-01-01T00:00:26Z", "type": "session_meta", "payload": {"id": "maple", "cwd": "../../../../project", "git": {"branch": "demo"}}}
+{"timestamp": "2025-01-01T00:00:26Z", "type": "turn_context", "payload": {"turn_id": "t1", "model": "demo-codex", "effort": "medium"}}
+{"timestamp": "2025-01-01T00:00:27Z", "type": "event_msg", "payload": {"type": "item_completed", "turn_id": "t1", "thread_id": "maple", "item": {"type": "UserMessage", "id": "u1", "content": [{"type": "text", "text": "Try a sunrise greeting."}]}}}
+{"timestamp": "2025-01-01T00:00:28Z", "type": "response_item", "payload": {"type": "custom_tool_call", "name": "apply_patch", "call_id": "maple-call", "input": "*** Begin Patch\n*** Update File: greeting.py\n@@\n-greeting = \"welcome\"\n+greeting = \"sunrise\"\n*** End Patch"}}
+{"timestamp": "2025-01-01T00:00:29Z", "type": "response_item", "payload": {"type": "custom_tool_call_output", "call_id": "maple-call", "output": "Success. Updated the following files:\nM greeting.py"}}
