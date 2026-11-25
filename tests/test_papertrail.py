@@ -428,3 +428,48 @@ def test_deletion_marks_follow_the_file(tmp_path):
     f = replay(str(path), [first, cut])
     (hunk,) = [h for h in f.hunks if h.edit == "cut"]
     assert f.status == "exact" and f.gaps == [(1, hunk.id)] and hunk.removed_text == "b\n"
+
+
+def text(*args):
+    """The command as a person runs it, without --json."""
+    exe = str(Path(sys.executable).with_name("papertrail"))
+    return subprocess.run([exe, *map(str, args)], check=False, capture_output=True, text=True)
+
+
+def test_cli_text_and_stale(tmp_path, sessions):
+    """Readable rows show the code. A file changed since ingest is flagged, not misquoted."""
+    project = tmp_path / "project"
+    project.mkdir()
+    file = project / "greeting.py"
+    file.write_text(GREETING.read_text())
+    moved = [
+        replace(s, edits=[replace(e, path=e.path.replace(str(PROJECT), str(project))) for e in s.edits])
+        for s in sessions
+    ]
+    store = project / ".papertrail/graph.rl"
+    build(store, moved)
+    assert (project / ".papertrail/.gitignore").read_text() == "*\n"
+
+    shown = text("blame", file, "--store", store)
+    assert shown.returncode == 0 and not shown.stderr
+    assert '      2 │ greeting = "morning"' in shown.stdout
+    assert "cedar  Morning greeting\n          Use a morning greeting" in shown.stdout
+    assert all(len(line) <= 100 for line in shown.stdout.splitlines())
+    traced = text("trace", f"{file}:2", "--store", store)
+    assert "Asked     Use a morning greeting" in traced.stdout and "claude --resume cedar" in traced.stdout
+    fresh = json.loads(cli("blame", file, "--store", store).stdout)
+    assert fresh["stale"] is False and "path" not in fresh
+
+    file.write_text("# new top line\n" + file.read_text())
+    for args in (("blame", file), ("trace", f"{file}:2"), ("crossings", file)):
+        assert json.loads(cli(*args, "--store", store).stdout)["stale"] is True
+    shown = text("blame", file, "--store", store)
+    assert "changed after this graph was built" in shown.stderr and "│" not in shown.stdout
+    assert "stale" not in json.loads(cli("crossings", "--store", store).stdout)
+
+
+def test_help_explains_every_command():
+    top = text("--help").stdout
+    for name in ("ingest", "blame", "trace", "session", "crossings", "stats", "skill", "ui"):
+        assert name in top and "\n" in text(name, "--help").stdout.split("options:")[0].strip()
+    assert "examples:" in top and "Graph file to read" in text("trace", "--help").stdout

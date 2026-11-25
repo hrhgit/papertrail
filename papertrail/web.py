@@ -26,7 +26,7 @@ from urllib.parse import parse_qs, urlparse
 
 import relate
 
-from .graph import build, select
+from .graph import build, portable_root, select
 from .queries import Queries
 from .sources import DEFAULT_LOGS, SOURCES, ReadProgress, load_sources
 from .transcript import conversation, written_diff
@@ -81,7 +81,7 @@ OPTIONAL MATCH (h)<-[:HAS_HUNK]-(:Edit)<-[:HAS_EDIT]-(s:Session)
 WITH r, owner, s, min(length(chain)) AS depth
 ORDER BY r.start, depth
 WITH r, owner, collect(CASE WHEN s IS NULL THEN NULL ELSE {session: s.id, depth: depth} END) AS lanes
-RETURN r.start AS start, r.end AS end, owner.kind AS kind, owner.id AS hunk, lanes
+RETURN r.start AS start, r.end AS end, owner.kind AS kind, owner.id AS hunk, owner.ts AS ts, lanes
 ORDER BY start"""
 
 # One row per deletion still between two current lines. `after` counts the lines
@@ -701,6 +701,10 @@ class Reader:
     def _new_job(self, folder, roots):
         self.open(folder)
         roots = roots or {name: Path.home() / DEFAULT_LOGS[name] for name in SOURCES}
+        # A portable folder carries its own logs, as the bundled demo does.
+        shipped = portable_root(self.store) if self.store else None
+        if shipped and (shipped / "logs").is_dir():
+            roots = {"claude-code": shipped / "logs/claude", "codex": shipped / "logs/codex"}
         with self.lock:
             self._close()
             self.job = BuildJob(self.project, self.store, roots)

@@ -3,7 +3,7 @@
 #
 #   ./start.sh                 graph for this repository, built from your own agent logs
 #   ./start.sh ~/code/my-app   graph for another project
-#   ./start.sh demo            bundled made-up sessions (no private logs involved)
+#   ./start.sh demo            bundled made-up project and sessions (no private logs involved)
 #   ./start.sh -r [target]     rebuild the graph first (after new sessions or edits)
 #
 # Environment: PORT (default 8765, next free port is used if taken), NO_BROWSER=1.
@@ -18,6 +18,8 @@ if [[ "${1:-}" == "-r" || "${1:-}" == "--refresh" ]]; then
   shift
 fi
 target="${1:-$repo}"
+demo=0
+[[ "$target" == "demo" ]] && demo=1
 
 command -v uv >/dev/null || {
   echo "uv is required: https://docs.astral.sh/uv/getting-started/installation/" >&2
@@ -26,18 +28,25 @@ command -v uv >/dev/null || {
 uv sync --locked --quiet
 
 mkdir -p .papertrail/ui
-if [[ "$target" == "demo" ]]; then
-  store="$repo/.papertrail/ui/demo.rl"
-  ingest=(--claude-logs tests/fixtures/logs --codex-logs tests/fixtures/codex-sessions
-    --project tests/fixtures/project)
+if [[ "$demo" == 1 ]]; then
+  target="$repo/demo/project"
+  store="$target/.papertrail/graph.rl"
+  # The repository ships this graph. Its paths are relative to demo/, so it opens anywhere.
+  ingest=(--claude-logs demo/logs/claude --codex-logs demo/logs/codex --project "$target" --portable demo)
 else
   [[ -d "$target" ]] || {
     echo "Not a directory: $target" >&2
     exit 1
   }
   target="$(cd "$target" && pwd)"
-  # One store per project, kept inside this repository's ignored folder.
-  store="$repo/.papertrail/ui/$(printf '%s' "$target" | tr '/ ' '__').rl"
+  # The project's own folder, where the command line and the agent skill look too.
+  store="$target/.papertrail/graph.rl"
+  old="$repo/.papertrail/ui/$(printf '%s' "$target" | tr '/ ' '__').rl"
+  if [[ -f "$old" && ! -e "$store" ]]; then
+    mkdir -p "$target/.papertrail"
+    [[ -e "$target/.papertrail/.gitignore" ]] || echo '*' >"$target/.papertrail/.gitignore"
+    mv "$old" "$store"
+  fi
   ingest=(--project "$target")
 fi
 
@@ -60,7 +69,7 @@ while True:
 PY
 )"
 
-args=(--store "$store" --port "$port")
+args=(--store "$store" --project "$target" --port "$port")
 [[ -n "${NO_BROWSER:-}" ]] && args+=(--no-browser)
 echo "Paper Trail reader: http://127.0.0.1:$port  (Ctrl+C to stop)"
 exec uv run --locked papertrail ui "${args[@]}"

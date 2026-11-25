@@ -1,8 +1,11 @@
 """Read-only query API. Every response includes the actual parameterized statements."""
 
+import hashlib
 from pathlib import Path
 
 import relate
+
+from .graph import ROOT, portable_root, swap
 
 OWNER = """
 OPTIONAL MATCH (s:Session)-[:HAS_EDIT]->(e:Edit)-[:HAS_HUNK]->(h)
@@ -40,6 +43,9 @@ class Queries:
     def __init__(self, store):
         if not Path(store).is_file():
             raise ValueError("Store missing. Run papertrail ingest or supply its --store path.")
+        # A portable graph names its folder by a placeholder. Find where that folder is now.
+        root = portable_root(store)
+        self.root = str(root) if root else None
         self.db = relate.connect(str(store), read_only=True)
         self.statements = []
 
@@ -56,7 +62,10 @@ class Queries:
 
     def _run(self, query, **params):
         self.statements.append(query.strip())
-        return self.db.execute(query, params).data()
+        if not self.root:
+            return self.db.execute(query, params).data()
+        rows = self.db.execute(query, swap(params, self.root, ROOT)).data()
+        return swap(rows, ROOT, self.root)
 
     def _result(self, query, params, limit):
         if limit is not None:
@@ -74,7 +83,7 @@ class Queries:
     def _file(self, file):
         path = str(Path(file).expanduser().resolve())
         rows = self._run(
-            "MATCH (f:File {id:$path}) RETURN f.lines AS lines, f.status AS status",
+            "MATCH (f:File {id:$path}) RETURN f.lines AS lines, f.status AS status, f.sha AS sha",
             path=path,
         )
         if not rows:
@@ -82,6 +91,22 @@ class Queries:
                 "File has no recorded edits. Check --store and the file path, or rebuild the graph."
             )
         return path, rows[0]
+
+    @staticmethod
+    def _stale(path, info):
+        """True when the file is no longer the one ingest compared against.
+
+        Ranges are line numbers in that earlier file, so they may now point elsewhere."""
+        if info["status"] in ("missing", "unreadable"):
+            return False
+        try:
+            data = Path(path).read_bytes()
+        except OSError:
+            return True
+        if info.get("sha"):
+            return hashlib.sha256(data).hexdigest() != info["sha"]
+        # A graph built before the digest was stored can only compare line counts.
+        return data.count(b"\n") + (bool(data) and not data.endswith(b"\n")) != info["lines"]
 
     @staticmethod
     def _bounds(info, start, end):
@@ -122,17 +147,19 @@ CASE WHEN r.end > $end THEN $end ELSE r.end END AS end, """
             + FIELDS.replace("p.text AS prompt", "left(p.text, 80) AS prompt")
             + " ORDER BY start"
         )
-        return self._result(
+        result = self._result(
             query,
             {"path": path, "start": start or 1, "end": end or info["lines"]},
             limit,
         )
+        return result | {"path": path, "stale": self._stale(path, info)}
 
     def trace(self, file, line, limit=None):
         self._begin()
         path, info = self._file(file)
         self._bounds(info, line, line)
-        return self._result(TRACE, {"path": path, "line": line}, limit)
+        result = self._result(TRACE, {"path": path, "line": line}, limit)
+        return result | {"path": path, "stale": self._stale(path, info)}
 
     def session(self, session_id, limit=None):
         self._begin()
@@ -157,8 +184,10 @@ event.id AS id, instruction.id AS prompt_id, instruction.text AS instruction, fi
 
     def crossings(self, file=None, limit=None):
         self._begin()
-        path = self._file(file)[0] if file else None
-        return self._crossings(path, limit)
+        if not file:
+            return self._crossings(None, limit)
+        path, info = self._file(file)
+        return self._crossings(path, limit) | {"path": path, "stale": self._stale(path, info)}
 
     def _crossings(self, path, limit):
         # A separate REPLACED match makes Relate 1.1.0 count all relationships

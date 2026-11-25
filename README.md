@@ -2,31 +2,81 @@
 
 Point at a line of code to find the agent that wrote it, the instruction it was following, and the conversation you can resume. Paper Trail reconstructs this history from existing Claude Code and Codex CLI transcripts. It runs locally with an embedded Relate database. It needs no hook, server, model or API key.
 
-## Trace a line across two agents
+## Who it is for
 
-From the repository root, with Python 3.11+ and uv installed:
+A developer who maintains code that coding agents wrote over many sessions, and who is about to change a line without knowing why it is the way it is. `git blame` names a commit and the person who made it. The request that produced the line sits in an agent transcript on the same disk, and nothing links the line to it.
+
+This is now an everyday situation, and the cost is time spent working out what code is for:
+
+- In Stack Overflow's 2026 Developer Survey (more than 30,000 respondents), 73% of the developers who use AI coding assistants or agents use them daily. Claude Code (66%) and GitHub Copilot (59%) are the most used. [Results](https://stackoverflow.blog/2026/10/06/the-results-of-the-2026-developer-survey-are-here/)
+- In the 2025 survey, 66% of developers named "AI solutions that are almost right, but not quite" as a frustration, and 45% said debugging AI-generated code takes more time. [AI section](https://survey.stackoverflow.co/2025/ai)
+- Reading code to understand it was already most of the job before agents. A field study of 78 professional developers over 3,148 working hours found that about 58% of their time went to program comprehension. [Xia et al., IEEE TSE 2018](https://xin-xia.github.io/publication/TSE17.pdf)
+
+Paper Trail shortens one part of that work: finding out what a person asked for when a line was written, and what it replaced. It does not measure how much time that saves.
+
+Recording this as code is written is being standardized. Cursor published [Agent Trace](https://github.com/cursor/agent-trace), a draft format for attributing code ranges to agents and conversations. That covers edits made after an agent adopts it. Paper Trail works backwards from the transcripts Claude Code and Codex have already left on disk, so it also covers code written last month.
+
+The second user is the agent itself. An agent that is asked to change a line can look up the earlier instruction first and say so when the new request contradicts it. [Let an agent look before it edits](#let-an-agent-look-before-it-edits)
+
+## Why is the retry limit 3?
+
+The repository includes a made-up project and the agent sessions that built it. `demo/project` is a small worker that delivers webhooks. `demo/logs` holds the transcripts of seven sessions spread over three weeks: four in Claude Code, one of which used a subagent, and three in Codex. Nothing in them is real. With Python 3.11+ and uv installed:
+
+```sh
+./start.sh demo
+```
+
+This opens the reader on `relay/config.py` line 6, `MAX_ATTEMPTS = 3`. The graph is already in the repository at `demo/project/.papertrail/graph.rl`, so nothing is built first.
+
+![The reader on relay/config.py line 6. The left column lists the lines several sessions changed, the middle shows the file with one coloured bar per writing session, and the right shows the instruction behind line 6 and the two sessions it replaced.](docs/images/reader.png)
+
+The code does not say why the limit is 3. The line's history does:
+
+1. The scaffold session (Claude Code) set it to 5.
+2. A Codex session raised it to 8 after a customer's endpoint was down for 20 minutes and 312 events were parked.
+3. A Claude Code session cut it to 3 two days later. Incident 2291: an endpoint timed out after it had already processed the event, so each of the 8 attempts created another charge. The instruction was to cap attempts at 3 "until receivers can drop repeats".
+
+**Follow session** on the last one shows what it did next: it added an `Idempotency-Key` header in `relay/delivery.py`, a test, and a note for receivers in the README. Anyone who wants 8 again now knows what to check first.
+
+The same history from the command line:
 
 ```sh
 uv sync --locked
-F=tests/fixtures/project/greeting.py
-S=.papertrail/mixed-demo.rl
-uv run papertrail ingest --claude-logs tests/fixtures/logs --codex-logs tests/fixtures/codex-sessions --project tests/fixtures/project --store "$S"
-uv run papertrail blame "$F" --store "$S"
-uv run papertrail trace "$F:2" --store "$S"
-uv run papertrail session birch --store "$S"
-uv run papertrail crossings "$F" --store "$S"
-uv run papertrail stats --store "$S"
+cd demo/project
+uv run papertrail blame relay/config.py
+uv run papertrail trace relay/config.py:6
+uv run papertrail session b27e5f90
+uv run papertrail crossings
+uv run papertrail stats
 ```
 
-Line 2 contains the morning greeting. Cedar (Claude Code) wrote it over Maple's sunrise greeting (Codex). Maple had replaced Birch's welcome (Claude Code). The trace continues into Amber's two earlier drafts. Following Birch's session forward reveals a change to a different file. Line 1 was inserted on disk later. Line 3 appeared between two recorded writes. All fixture conversations and files are fictional. The resume commands in this example contain fictional IDs. [Complete example output](docs/example-session.md)
+These read the committed graph, the same file `./start.sh demo` opens. [Complete example output](docs/example-session.md)
+
+To build it again from the transcripts, run this in `demo/project`:
+
+```sh
+uv run papertrail ingest --claude-logs ../logs/claude --codex-logs ../logs/codex --project . --portable ..
+```
+
+A graph normally records absolute paths. `--portable DIR` writes the path of `DIR` as a placeholder and records where the store sits inside it. Queries work out the folder's current location from the store's own, so the demo answers the same on any machine and the committed file names no home directory.
+
+Other things to look at in the demo:
+
+- `relay/config.py` lines 9 and 10 were changed by hand between two sessions. They are marked as an external edit, with no instruction.
+- `backoff_delay` in `relay/delivery.py` was written by Claude Code, rewritten by Codex and rewritten again by Claude Code.
+- `relay/delivery.py` has a red triangle where a Codex session deleted the legacy `X-Signature` header.
+- `tests/test_delivery.py` was written by a subagent. Its lines lead back to the instruction the person gave the parent session.
+- The last line of `README.md` was added on disk after the final session.
+
+`scripts/make_demo.py` writes the whole demo, graph included. Tests check that running it reproduces the committed project and transcripts, and that the committed graph gives the answers above after the folder is copied somewhere else.
 
 ## Read it in the browser
 
 ```sh
-uv run papertrail ui --store .papertrail/mixed-demo.rl
+uv run papertrail ui --project demo/project
 ```
 
-This opens a local reader at `http://127.0.0.1:8765/`. It opens on the busiest crossing: a spot several sessions rewrote. Each session is a colored track beside the line numbers. Where tracks run side by side, those sessions all rewrote that spot; the newest is outermost. Click a line to see its route back through every change, with the instruction behind each one. **Follow session** dims every line that session did not touch and lists its instructions and edits in order. **Cypher** reveals the statements behind the current view. Labels are short; hover one for its full meaning.
+This opens a local reader at `http://127.0.0.1:8765/`. The sidebar opens on the Files tab, with the code pane showing the busiest crossing: a spot several sessions rewrote. Each session is a colored track beside the line numbers. Where tracks run side by side, those sessions all rewrote that spot; the newest is outermost. Click a line to see its route back through every change, with the instruction behind each one. **Follow session** dims every line that session did not touch and lists its instructions and edits in order. **Cypher** reveals the statements behind the current view. Labels are short; hover one for its full meaning.
 
 The code shows the file as it is now, so deleted lines leave no line of their own. A small red triangle between two lines marks a spot where lines were taken out. Click it to unfold the removed text in place; the panel names who deleted it, shows that step of the conversation, and lists the sessions that wrote the lines in the first place. **Deleted** beside the file name unfolds every spot in the file at once. Rewriting the lines around a spot later removes its mark, because the deletion is then part of that rewrite's history.
 
@@ -50,6 +100,23 @@ The reader uses the same read-only query layer as the CLI. It listens on loopbac
 
 The reader loads its page files when the server starts, so restart `papertrail ui` to pick up changes. If a tab is still open after a restart, it offers a **Reload** button the next time it contacts the server.
 
+## Let an agent look before it edits
+
+```sh
+uv run papertrail skill --project /absolute/path/to/project
+```
+
+This writes a skill to `.claude/skills/papertrail/SKILL.md` in that project. The skill tells Claude Code to run `blame` and `trace` before it changes code it did not write, and to treat the instruction behind a line as a constraint the human may still hold. Asked to raise `MAX_ATTEMPTS` back to 8 in the demo project, Claude Code with the skill made no edit. It reported the three instructions behind the line, pointed out that the limit was cut after incident 2291 and that nothing shows the receiver drops repeats yet, asked which way to go, and offered the command that reopens the incident conversation.
+
+| Option | Effect |
+| --- | --- |
+| `--agent codex` | Installs to `~/.codex/skills/papertrail/`. Codex skills always go to the home folder. `--agent all` installs both. |
+| `--global` | Installs the Claude Code skill to `~/.claude/skills/papertrail/` for every project. |
+| `--store PATH` | Adds `--store PATH` to every command in the skill. Without it the agent uses `.papertrail/graph.rl` in the project. |
+| `--print` | Prints the skill and writes nothing. |
+
+The skill contains the command that starts this installation: `papertrail` when it is on `PATH`, otherwise `uv run --project` with this checkout's path. Run the command again after moving the checkout. The agent only reads the graph. The skill tells it to keep past prompts out of commits and comments.
+
 ## Index your own project
 
 Run these commands from the Paper Trail checkout. Set `P` to the absolute path of the project you want to investigate.
@@ -63,24 +130,26 @@ uv run papertrail trace "$P/src/main.py:17" --store "$P/.papertrail/graph.rl" --
 
 By default ingest scans both `~/.claude/projects` and `~/.codex/sessions`. A missing directory appears in the summary. Use `--source codex --logs DIR` or `--source claude-code --logs DIR` to scan one source. The original `--logs DIR` form selects Claude Code. Set `--claude-logs DIR --codex-logs DIR` to specify both roots. Without `--project`, ingest uses the current directory. A project selects **sessions that edited a file under that directory**. Their other edits stay in the graph so that session navigation works. Ancestors needed for delegation retain their prompts. An explicit move into the project also brings in earlier sessions that edited the old path. Coverage for this store includes all retained files. Use `--all` to include every session in the log root. Source diagnostic counts cover the scanned logs before project selection.
 
-The default store is `.papertrail/graph.rl` in the selected project. Query commands look in the current directory's `.papertrail` unless given `--store`. Ingest builds a private single-file graph beside the selected store, commits in batches and publishes the completed file atomically. Check the store path when switching projects. Queries open it read-only. Run ingest again after changing files or receiving new logs.
+The default store is `.papertrail/graph.rl` in the selected project. `./start.sh PROJECT`, the reader's **Build History** button and `ingest --project` all write to that file, so a graph built by one is found by the others and by the agent skill. Ingest also writes a `.gitignore` containing `*` into a new `.papertrail` folder. Query commands look in the current directory's `.papertrail` unless given `--store`. Ingest builds a private single-file graph beside the selected store, commits in batches and publishes the completed file atomically. Check the store path when switching projects. Queries open it read-only. Run ingest again after changing files or receiving new logs.
 
-**Privacy.** The graph contains private prompts, file paths, log locations and code excerpts. Keep a real graph on your own machine. The default directory and graph files are gitignored here. If you run against another repository, add `.papertrail/` to its ignore file or choose a private store elsewhere. Ingest prints only counts and elapsed time. Queries deliberately reveal details from the indexed conversations.
+**Privacy.** The graph contains private prompts, file paths, log locations and code excerpts. Keep a real graph on your own machine. The default directory and graph files are gitignored here, except the demo's graph, which holds only the made-up sessions. The `.gitignore` that ingest writes keeps the folder out of another repository's history. If you choose a store outside a `.papertrail` folder, keep it private yourself. Ingest prints only counts and elapsed time. Queries deliberately reveal details from the indexed conversations.
 
 ## Query options
 
 | Command | Result |
 | --- | --- |
-| `blame FILE [-L START,END]` | Inclusive, one-based disk ranges. Each row includes the writer, model and reasoning effort, time, title, session and prompt preview. |
+| `blame FILE [-L START,END]` | Inclusive, one-based disk ranges. Each row includes the writer, model and reasoning effort, time, title, session and prompt preview. The readable form prints the code under each writer. |
 | `trace FILE:LINE` | The current writer at depth zero and each replacement path. Agent entries include the full prompt, resume command, working directory, log and files edited earlier and later in that session. |
 | `session ID` | Human instructions and completed edits in time order. An unambiguous prefix works. A delegated edit can lead back to a parent's instruction. |
 | `crossings [FILE]` | Current ranges or historical endpoints whose replacement history contains at least two sessions. A historical endpoint has null line numbers. The JSON fields `agents` and `agent_count` identify crossings between agents. |
 | `stats` | Node counts by type, relationships, disk comparison results and line counts by origin. The `by_agent` table counts sessions, edits, unplaced edits and currently attributed lines. |
 
-All five queries accept `--json`, `--limit N` and `--show-cypher`. A successful JSON response has `rows` and `truncated`. Adding `--show-cypher` includes the parameterized statements in `cypher`. Limits count result rows and request one extra row to detect truncation. Omitting the option requests the full result. A command error writes an actionable message to stderr and exits nonzero. With `--json` its shape is `{"error":"..."}`.
+All five queries accept `--json`, `--limit N` and `--show-cypher`. A successful JSON response has `rows` and `truncated`. Adding `--show-cypher` includes the parameterized statements in `cypher`. Limits count result rows and request one extra row to detect truncation. Omitting the option requests the full result. A command error writes an actionable message to stderr and exits nonzero. With `--json` its shape is `{"error":"..."}`. `papertrail --help` lists the commands with examples, and each command has its own `--help`.
+
+Ranges are line numbers in the file as ingest read it. Ingest stores a SHA-256 of each file, and `blame`, `trace` and `crossings FILE` compare it with the file on disk. When they differ, the JSON response has `"stale": true`, and the readable form prints a warning on stderr and leaves the code out. Run ingest again to clear it.
 
 ```sh
-uv run papertrail trace "$F:2" --store "$S" --limit 2 --json --show-cypher
+uv run papertrail trace demo/project/relay/config.py:6 --store demo/project/.papertrail/graph.rl --limit 2 --json --show-cypher
 ```
 
 ## How the graph answers the question
@@ -128,7 +197,7 @@ Paper Trail uses Relate's **single-file** mode. One closed `.rl` file identifies
 ```sh
 uv run python - <<'PY'
 import relate
-with relate.connect(".papertrail/mixed-demo.rl", read_only=True) as db:
+with relate.connect("demo/project/.papertrail/graph.rl", read_only=True) as db:
     print(db.execute("""
         MATCH (e:Edit)-[:HAS_HUNK]->(h)-[r:REPLACED]->(old:Hunk)
         RETURN e.tool AS tool, h.kind AS writer, old.kind AS predecessor, r.lines AS lines
@@ -141,8 +210,8 @@ The application API uses the same queries as the CLI. Each method returns plain 
 ```python
 from papertrail.queries import Queries
 
-with Queries(".papertrail/mixed-demo.rl") as graph:
-    result = graph.trace("tests/fixtures/project/greeting.py", 2)
+with Queries("demo/project/.papertrail/graph.rl") as graph:
+    result = graph.trace("demo/project/relay/config.py", 6)
     print(result["rows"][0]["prompt"])
 ```
 

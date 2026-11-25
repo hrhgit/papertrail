@@ -6,3 +6,6 @@ __pycache__/
 *.egg-info/
 *.rl
 *.rl.*
+# The demo ships its graph.
+!/demo/project/.papertrail/
+!/demo/project/.papertrail/graph.rl

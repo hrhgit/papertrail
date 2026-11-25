@@ -448,7 +448,7 @@ body.picking { cursor: progress; }
 .lines { list-style: none; margin: 0; padding: 6px 0 40px; font: 13px/var(--row) var(--mono); min-width: max-content; }
 .ln {
   display: grid;
-  grid-template-columns: var(--tracks-w, 12px) 3.5em 1fr;
+  grid-template-columns: var(--tracks-w, 12px) var(--who-w, 0px) 3.5em 1fr;
   height: var(--row);
   cursor: pointer;
 }
@@ -462,6 +462,13 @@ body.picking { cursor: progress; }
 .tracks i.older { width: 4px; }
 .ln.top .tracks i:first-child { border-top: 2px solid var(--surface); }
 .ln.cross .num { color: var(--ink); font-weight: 700; }
+/* The writer's logo, once per block. Fixed width, so it never pushes the code. */
+.ln .who { display: grid; place-items: center; overflow: hidden; }
+.ln.dim > .who { opacity: var(--dim); }
+.logo { width: 12px; height: 12px; flex: none; stroke: none; }
+.logo-claude { fill: #d97757; }
+.logo-codex { fill: var(--ink); }
+.session .name .logo { margin-left: 6px; vertical-align: -1.5px; }
 
 /* Deleted lines: a mark between two lines, in the deleter's color */
 .title-row { display: flex; align-items: center; gap: 12px; }
@@ -485,19 +492,21 @@ body.picking { cursor: progress; }
   position: absolute;
   z-index: 2;
   left: 0;
-  top: -7px;
-  width: 13px;
-  height: 14px;
+  right: 0;
+  top: -5px;
+  width: auto;
+  height: 10px;
   padding: 0;
   border: 0;
   border-radius: 0;
   background: none;
+  cursor: pointer;
 }
 .gap-mark::before {
   content: "";
   position: absolute;
   left: 1px;
-  top: 1px;
+  top: -1px;
   border-style: solid;
   border-width: 6px 0 6px 8px;
   border-color: transparent transparent transparent var(--gap);
@@ -509,14 +518,15 @@ body.picking { cursor: progress; }
 .gap.dim { opacity: var(--dim); }
 .gap.open { height: auto; margin: 2px 0; }
 .gap.open::after { display: none; }
-.gap.open .gap-mark { top: -1px; }
+.gap.open .gap-mark { top: -1px; right: auto; width: 13px; height: 14px; }
+.gap.open .gap-mark::before { top: 1px; }
 .gap.open .gap-mark::before { transform: rotate(90deg); }
 .gap.open.dim { opacity: 1; }
 .gap.open.dim .gap-block { opacity: var(--dim); }
 .gap-block { cursor: pointer; background: color-mix(in srgb, #d7352b 7%, var(--surface)); }
 .gap-block + .gap-block { border-top: 1px solid var(--rule); }
 .gap.sel .gap-block { box-shadow: inset 0 0 0 1px color-mix(in srgb, #d7352b 40%, transparent); }
-.gap-head, .gap-ln { display: grid; grid-template-columns: var(--tracks-w, 12px) 3.5em 1fr; height: var(--row); }
+.gap-head, .gap-ln { display: grid; grid-template-columns: calc(var(--tracks-w, 12px) + var(--who-w, 0px)) 3.5em 1fr; height: var(--row); }
 .gap-head .tracks, .gap-ln .tracks { padding-left: 8px; }
 .gap-ln .tracks i { width: var(--track); background: repeating-linear-gradient(180deg, var(--gap) 0 3px, transparent 3px 6px); }
 .gap-what { display: flex; align-items: center; gap: 7px; font: 12px/var(--row) var(--ui); color: var(--muted); white-space: nowrap; }

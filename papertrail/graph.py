@@ -1,5 +1,6 @@
 """Build and verify a private generation before publishing the single-file graph."""
 
+import hashlib
 import os
 from collections import defaultdict
 from dataclasses import asdict, replace
@@ -53,12 +54,52 @@ def select(sessions, project):
     return [s if s.id in selected else replace(s, edits=[]) for s in sessions if s.id in keep]
 
 
-def build(store, sessions, stage=None):
-    """Write the graph. `stage`, if given, hears ("replay") and ("write", files=N)."""
+# Stands for the folder a portable graph was built in. See `build`.
+ROOT = "/$PAPERTRAIL_ROOT"
+
+
+def swap(value, old, new):
+    """Replace one folder's path with another in every string of a nested value."""
+    if isinstance(value, str):
+        return value.replace(old, new)
+    if isinstance(value, list):
+        return [swap(v, old, new) for v in value]
+    if isinstance(value, dict):
+        return {k: swap(v, old, new) for k, v in value.items()}
+    return value
+
+
+def portable_root(store):
+    """The folder a portable graph belongs to, found from where the store is now."""
+    store = Path(store).resolve()
+    if not store.is_file():
+        return None
+    try:
+        with relate.connect(str(store), read_only=True) as db:
+            rows = db.execute("MATCH (m:PaperTrail) RETURN m.portable AS portable").data()
+    except relate.Error:
+        return None
+    relative = rows[0]["portable"] if rows else None
+    return (store.parent / relative).resolve() if relative else None
+
+
+def build(store, sessions, stage=None, portable=None):
+    """Write the graph. `stage`, if given, hears ("replay") and ("write", files=N).
+
+    `portable` names a folder that holds the project, its logs and the store. Its path
+    is written as a placeholder, and the graph records where the store sits inside it,
+    so the folder can be copied to another machine and the queries still find the files.
+    Rebuilding a portable graph keeps it portable.
+    """
     store = Path(store)
+    portable = portable or portable_root(store)
     if store.suffix != ".rl":
         raise ValueError("Choose a single-file --store ending in .rl.")
     store.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    # The graph holds private prompts. Keep a project's own folder out of its git history.
+    ignore = store.parent / ".gitignore"
+    if store.parent.name == ".papertrail" and not ignore.exists():
+        ignore.write_text("*\n")
     nodes, edges = defaultdict(list), defaultdict(list)
 
     def link(a, kind, b, left, right, **attrs):
@@ -108,6 +149,7 @@ def build(store, sessions, stage=None):
                 "path": f.path,
                 "status": f.status,
                 "lines": f.lines,
+                "sha": digest(f.path) if f.status in ("exact", "drift", "unresolved") else "",
                 "unapplied": f.unapplied,
                 "external_events": f.external_events,
             }
@@ -138,12 +180,18 @@ def build(store, sessions, stage=None):
     if stage:
         stage("write", files=len(nodes["File"]))
     store = store.resolve()
+    meta = {"version": 1}
+    if portable:
+        base = Path(portable).resolve()
+        meta["portable"] = os.path.relpath(base, store.parent)
+        for rows in (*nodes.values(), *edges.values()):
+            rows[:] = swap(rows, str(base), ROOT)
     with TemporaryDirectory(prefix=".papertrail-build-", dir=store.parent) as tmp:
         staged = Path(tmp) / "graph.rl"
         staged.touch(mode=0o600)
         with relate.connect(str(staged)) as db:
             db.autocommit = True
-            db.execute("CREATE (:PaperTrail {version:1})")
+            db.execute("CREATE (m:PaperTrail) SET m = $meta", {"meta": meta})
             for label, rows in nodes.items():
                 db.execute(
                     f"CREATE CONSTRAINT IF NOT EXISTS FOR (n:{label}) REQUIRE n.id IS UNIQUE"
@@ -172,6 +220,14 @@ def build(store, sessions, stage=None):
                         "Existing store belongs to another application. Choose a fresh --store."
                     )
                 os.replace(staged, store)
+
+
+def digest(path):
+    """Identity of the file ingest compared against, so a query can tell it has changed."""
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except OSError:
+        return ""
 
 
 def write_rows(db, query, rows, relationship=None):
