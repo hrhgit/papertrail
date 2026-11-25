@@ -2,7 +2,7 @@
 
 import hashlib
 import heapq
-from collections import defaultdict, deque
+from collections import OrderedDict, defaultdict, deque
 from functools import lru_cache
 from pathlib import Path
 
@@ -32,6 +32,15 @@ e.id AS edit, s.log_path AS log_path, s.cwd AS cwd, s.resume AS resume, s.resume
     + FIELDS
     + " ORDER BY depth, chain"
 )
+
+SESSION_EDITS = """
+UNWIND $sessions AS id
+MATCH (s:Session {id:id})-[:HAS_EDIT]->(e:Edit)
+OPTIONAL MATCH (e)-[:NEXT]->(following:Edit)
+OPTIONAL MATCH (e)<-[:NEXT]-(previous:Edit)
+RETURN s.id AS session, e.id AS edit, e.path AS path, e.ts AS ts, e.seq AS seq,
+id(e) AS node, id(following) AS following, id(previous) AS previous
+ORDER BY ts, seq"""
 
 EDIT_FILES = """
 UNWIND $ids AS id
@@ -90,6 +99,50 @@ def file_fingerprint(path, version):
             newlines += chunk.count(b"\n")
             last = chunk[-1:]
     return digest.hexdigest(), newlines + bool(last and last != b"\n")
+
+
+def _ordered_edit_chains(edits):
+    """Follow NEXT to break ties in the database's (timestamp, sequence) order."""
+    ranks = {(edit["ts"], edit["seq"]): index for index, edit in enumerate(edits)}
+    pending = {edit["node"]: edit for edit in edits}
+    if len(pending) != len(edits):
+        return None
+    chains = []
+    for head in edits:
+        if head["previous"] is not None:
+            continue
+        chain, edit = [], head
+        while True:
+            chain.append(pending.pop(edit["node"]))
+            if edit["following"] is None:
+                break
+            following = pending.get(edit["following"])
+            if (
+                following is None
+                or following["previous"] != edit["node"]
+                or ranks[following["ts"], following["seq"]] < ranks[edit["ts"], edit["seq"]]
+            ):
+                return None
+            edit = following
+        chains.append(chain)
+    return None if pending else chains
+
+
+def _chain_files(chain, hits):
+    previous, following, files = {}, OrderedDict(), {}
+    for edit in chain:
+        if edit["edit"] in hits:
+            files[edit["edit"]] = {"previous_files": list(previous)}
+        if edit["path"] is not None:
+            previous[edit["path"]] = None
+    for edit in reversed(chain):
+        if edit["edit"] in files:
+            files[edit["edit"]]["next_files"] = list(following)
+        if edit["path"] is not None:
+            following[edit["path"]] = None
+            # A closer occurrence determines where a repeated path appears.
+            following.move_to_end(edit["path"], last=False)
+    return files
 
 
 class Queries:
@@ -221,14 +274,33 @@ CASE WHEN r.end > $end THEN $end ELSE r.end END AS end, """
         path, info = self._file(file)
         self._bounds(info, line, line)
         result = self._result(TRACE, {"path": path, "line": line}, limit)
-        ids = list(dict.fromkeys(row["edit"] for row in result["rows"] if row["edit"] is not None))
-        if ids:
-            chains = {row["edit"]: row for row in self._run(EDIT_FILES, ids=ids)}
+        hits = [row for row in result["rows"] if row["edit"] is not None]
+        if hits:
+            files = self._trace_files(hits)
             for row in result["rows"]:
-                if row["edit"] in chains:
-                    row.update(chains[row["edit"]])
+                row.update(files.get(row["edit"], {}))
             result["cypher"] = list(self.statements)
         return result | {"path": path, "stale": self._stale(path, info)}
+
+    def _trace_files(self, hits):
+        ids = dict.fromkeys(row["edit"] for row in hits)
+        sessions = list(dict.fromkeys(row["session"] for row in hits if row["session"] is not None))
+        edits = defaultdict(list)
+        if sessions:
+            for row in self._run(SESSION_EDITS, sessions=sessions):
+                edits[row["session"]].append(row)
+
+        files = {}
+        for session_edits in edits.values():
+            for chain in _ordered_edit_chains(session_edits) or ():
+                files.update(_chain_files(chain, ids))
+
+        # Keep the old traversal for graphs with links outside a session's
+        # ordered edit chains, or edits without an owning session.
+        remaining = [edit for edit in ids if edit not in files]
+        if remaining:
+            files.update((row["edit"], row) for row in self._run(EDIT_FILES, ids=remaining))
+        return files
 
     def _tracks(self, path, start=None, end=None):
         query = TRACK_RANGES
