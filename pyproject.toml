@@ -2,6 +2,8 @@
 name = "papertrail-relate"
 version = "0.1.0"
 description = "Local line history from coding agent sessions"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
 dependencies = ["relate-db==1.1.0"]
 
