@@ -1,11 +1,14 @@
 """Read-only query API. Every response includes the actual parameterized statements."""
 
 import hashlib
+import heapq
+from collections import defaultdict, deque
+from functools import lru_cache
 from pathlib import Path
 
 import relate
 
-from .graph import ROOT, portable_root, swap
+from .graph import ROOT, swap
 
 OWNER = """
 OPTIONAL MATCH (s:Session)-[:HAS_EDIT]->(e:Edit)-[:HAS_HUNK]->(h)
@@ -22,6 +25,17 @@ MATCH chain=(owner)-[:REPLACED*0..]->(h:Hunk)
 """
     + OWNER
     + """
+RETURN length(chain) AS depth, [n IN nodes(chain) | n.id] AS chain,
+[edge IN relationships(chain) | edge.lines] AS replaced_lines,
+e.id AS edit, s.log_path AS log_path, s.cwd AS cwd, s.resume AS resume, s.resume_cwd AS resume_cwd,
+[] AS previous_files, [] AS next_files, """
+    + FIELDS
+    + " ORDER BY depth, chain"
+)
+
+EDIT_FILES = """
+UNWIND $ids AS id
+MATCH (e:Edit {id:id})
 CALL (e) {
   MATCH previous=(e)<-[:NEXT*1..]-(prev:Edit)
   WITH prev, length(previous) AS hops ORDER BY prev.ts, prev.seq, hops DESC
@@ -31,26 +45,74 @@ CALL (e) {
   MATCH (e)-[:NEXT*1..]->(following:Edit)
   WITH following ORDER BY following.ts, following.seq RETURN collect(DISTINCT following.path) AS next_files
 }
-RETURN length(chain) AS depth, [n IN nodes(chain) | n.id] AS chain,
-[edge IN relationships(chain) | edge.lines] AS replaced_lines,
-e.id AS edit, s.log_path AS log_path, s.cwd AS cwd, s.resume AS resume, s.resume_cwd AS resume_cwd, previous_files, next_files, """
-    + FIELDS
-    + " ORDER BY depth, chain"
-)
+RETURN e.id AS edit, previous_files, next_files"""
+
+TRACK_RANGES = """
+MATCH (f:File {id:$path})-[:HAS_RANGE]->(r:Range)-[:FROM]->(owner:Hunk)
+RETURN r.start AS start, r.end AS end, owner.kind AS kind, owner.id AS hunk, owner.ts AS ts
+ORDER BY start"""
+
+REPLACED_EDGES = """
+MATCH (h:Hunk)-[:REPLACED]->(old:Hunk)
+RETURN h.id AS hunk, old.id AS old"""
+
+HUNK_SESSIONS = """
+MATCH (h:Hunk)<-[:HAS_HUNK]-(:Edit)<-[:HAS_EDIT]-(s:Session)
+RETURN h.id AS hunk, s.id AS session, s.agent AS agent"""
+
+CROSSING_TIPS = """
+MATCH (f:File{file})-[:HAS_HISTORY]->(tip:Hunk)
+WHERE EXISTS {{ MATCH (tip)<-[:FROM]-(:Range)<-[:HAS_RANGE]-(f) }}
+   OR (NOT EXISTS {{ MATCH (tip)<-[:REPLACED]-() }}
+       AND NOT EXISTS {{ MATCH (tip)<-[:FROM]-(:Range) }})
+RETURN DISTINCT f.id AS id, f.path AS path, tip.id AS hunk"""
+
+CROSSING_RANGES = """
+UNWIND $tips AS crossing
+MATCH (f:File {id:crossing.id}), (tip:Hunk {id:crossing.hunk})
+OPTIONAL MATCH (tip)<-[:FROM]-(r:Range)<-[:HAS_RANGE]-(f)
+RETURN crossing.path AS path, crossing.hunk AS hunk, r.start AS start, r.end AS end,
+crossing.sessions AS sessions, size(crossing.sessions) AS session_count,
+crossing.agents AS agents, size(crossing.agents) AS agent_count
+ORDER BY session_count DESC, path, hunk, start"""
+
+
+def file_version(stat):
+    return stat.st_dev, stat.st_ino, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size
+
+
+@lru_cache(maxsize=128)
+def file_fingerprint(path, version):
+    digest, newlines, last = hashlib.sha256(), 0, b""
+    with Path(path).open("rb") as stream:
+        while chunk := stream.read(65536):
+            digest.update(chunk)
+            newlines += chunk.count(b"\n")
+            last = chunk[-1:]
+    return digest.hexdigest(), newlines + bool(last and last != b"\n")
 
 
 class Queries:
     def __init__(self, store):
-        if not Path(store).is_file():
+        store = Path(store).resolve()
+        if not store.is_file():
             raise ValueError("Store missing. Run papertrail ingest or supply its --store path.")
-        # A portable graph names its folder by a placeholder. Find where that folder is now.
-        root = portable_root(store)
-        self.root = str(root) if root else None
         self.db = relate.connect(str(store), read_only=True)
+        # Resolve the portable folder using this connection's own snapshot.
+        try:
+            rows = self.db.execute("MATCH (m:PaperTrail) RETURN m.portable AS portable").data()
+            relative = rows[0]["portable"] if rows else None
+            self.root = str((store.parent / relative).resolve()) if relative else None
+        except BaseException:
+            self.db.close()
+            raise
         self.statements = []
 
     def _begin(self):
         self.statements.clear()
+        self.validate()
+
+    def validate(self):
         if not self._run("MATCH (:PaperTrail {version:1}) RETURN 1 AS ok"):
             raise ValueError("Unrecognized graph. Run papertrail ingest with a fresh --store.")
 
@@ -100,13 +162,13 @@ class Queries:
         if info["status"] in ("missing", "unreadable"):
             return False
         try:
-            data = Path(path).read_bytes()
+            digest, lines = file_fingerprint(path, file_version(Path(path).stat()))
         except OSError:
             return True
         if info.get("sha"):
-            return hashlib.sha256(data).hexdigest() != info["sha"]
+            return digest != info["sha"]
         # A graph built before the digest was stored can only compare line counts.
-        return data.count(b"\n") + (bool(data) and not data.endswith(b"\n")) != info["lines"]
+        return lines != info["lines"]
 
     @staticmethod
     def _bounds(info, start, end):
@@ -159,7 +221,77 @@ CASE WHEN r.end > $end THEN $end ELSE r.end END AS end, """
         path, info = self._file(file)
         self._bounds(info, line, line)
         result = self._result(TRACE, {"path": path, "line": line}, limit)
+        ids = list(dict.fromkeys(row["edit"] for row in result["rows"] if row["edit"] is not None))
+        if ids:
+            chains = {row["edit"]: row for row in self._run(EDIT_FILES, ids=ids)}
+            for row in result["rows"]:
+                if row["edit"] in chains:
+                    row.update(chains[row["edit"]])
+            result["cypher"] = list(self.statements)
         return result | {"path": path, "stale": self._stale(path, info)}
+
+    def _tracks(self, path, start=None, end=None):
+        query = TRACK_RANGES
+        if start is not None:
+            query = query.replace("RETURN", "WHERE r.end >= $start AND ($end IS NULL OR r.start <= $end)\nRETURN", 1)
+        rows = self._run(query, path=path, start=start, end=end)
+        if not rows:
+            return rows
+        edges, sessions = self._read_lineage()
+        by_owner = {}
+        for row in rows:
+            owner = row["hunk"]
+            if owner not in by_owner:
+                by_owner[owner] = self._lanes(owner, edges, sessions)
+            row["lanes"] = by_owner[owner]
+        return rows
+
+    def _read_lineage(self):
+        if not hasattr(self, "_lineage"):
+            edges, sessions = defaultdict(list), defaultdict(list)
+            for row in self._run(REPLACED_EDGES):
+                edges[row["hunk"]].append(row["old"])
+            for row in self._run(HUNK_SESSIONS):
+                sessions[row["hunk"]].append((row["session"], row["agent"]))
+            self._lineage = edges, sessions
+        else:
+            self.statements.extend((REPLACED_EDGES.strip(), HUNK_SESSIONS.strip()))
+        return self._lineage
+
+    @staticmethod
+    def _branches(owner, edges):
+        # Relate's path expansion visits the most recently added edge first
+        # and descends before moving on to the next branch.
+        stack, seen = [owner], set()
+        while stack:
+            node = stack.pop()
+            if node in seen:
+                continue
+            seen.add(node)
+            yield node
+            stack.extend(reversed(edges.get(node, ())))
+
+    @classmethod
+    def _lanes(cls, owner, edges, sessions):
+        depths, queue = {owner: 0}, deque([owner])
+        while queue:
+            node = queue.popleft()
+            for old in edges.get(node, ()):
+                if old not in depths:
+                    depths[old] = depths[node] + 1
+                    queue.append(old)
+
+        # The old path query visited branches depth-first. Keep that tie order
+        # for equal session depths while skipping already visited hunks.
+        lanes = {}
+        for node in cls._branches(owner, edges):
+            for session, _ in sessions.get(node, ()):
+                if session is not None:
+                    lanes[session] = min(lanes.get(session, depths[node]), depths[node])
+        return [
+            {"session": session, "depth": depth}
+            for session, depth in sorted(lanes.items(), key=lambda lane: lane[1])
+        ]
 
     def session(self, session_id, limit=None):
         self._begin()
@@ -190,24 +322,33 @@ event.id AS id, instruction.id AS prompt_id, instruction.text AS instruction, fi
         return self._crossings(path, limit) | {"path": path, "stale": self._stale(path, info)}
 
     def _crossings(self, path, limit):
-        # A separate REPLACED match makes Relate 1.1.0 count all relationships
-        # for each tip. Keep the walk in the same pattern as HAS_HISTORY.
-        query = (
-            "MATCH (f:File"
-            + (" {id:$path}" if path else "")
-            + """)-[:HAS_HISTORY]->(tip:Hunk)-[:REPLACED*0..]->(h:Hunk)
-      <-[:HAS_HUNK]-(:Edit)<-[:HAS_EDIT]-(s:Session)
-WITH f, tip, collect(DISTINCT s.id) AS sessions, collect(DISTINCT s.agent) AS agents
-WHERE size(sessions) >= 2 AND (
-  EXISTS { MATCH (tip)<-[:FROM]-(:Range)<-[:HAS_RANGE]-(f) }
-  OR (NOT EXISTS { MATCH (tip)<-[:REPLACED]-() }
-      AND NOT EXISTS { MATCH (tip)<-[:FROM]-(:Range) })
-)
-OPTIONAL MATCH (tip)<-[:FROM]-(r:Range)<-[:HAS_RANGE]-(f)
-RETURN f.path AS path, tip.id AS hunk, r.start AS start, r.end AS end, sessions,
-size(sessions) AS session_count, agents, size(agents) AS agent_count ORDER BY session_count DESC, path, hunk, start"""
-        )
-        return self._result(query, {"path": path}, limit)
+        if limit is not None and limit < 1:
+            raise ValueError("Use a positive --limit.")
+        tips = self._run(CROSSING_TIPS.format(file=" {id:$path}" if path else ""), path=path)
+        if not tips:
+            return {"rows": [], "truncated": False, "cypher": list(self.statements)}
+        edges, owners = self._read_lineage()
+
+        def shared_tips():
+            for tip in tips:
+                sessions, agents = {}, {}
+                for node in self._branches(tip["hunk"], edges):
+                    for session, agent in owners.get(node, ()):
+                        if session is not None:
+                            sessions[session] = None
+                        if agent is not None:
+                            agents[agent] = None
+                if len(sessions) >= 2:
+                    yield tip | {"sessions": list(sessions), "agents": list(agents)}
+
+        candidates = shared_tips()
+        if limit is not None:
+            # Every tip contributes at least one row. Limit the tips before
+            # looking up ranges, then limit the final rows too.
+            candidates = heapq.nsmallest(
+                limit + 1, candidates, key=lambda tip: (-len(tip["sessions"]), tip["path"], tip["hunk"]),
+            )
+        return self._result(CROSSING_RANGES, {"tips": list(candidates)}, limit)
 
     def stats(self, limit=None):
         self._begin()

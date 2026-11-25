@@ -11,6 +11,7 @@ Edit nodes, which is how a change found in the graph lands on its exact step.
 
 import json
 import re
+from bisect import bisect_right
 from pathlib import Path
 
 from .sources.claude import result_text, unified, user_text
@@ -450,7 +451,8 @@ def call_key(edit):
 
 
 def attach(steps, edits):
-    tools = [i for i in steps.items if i["kind"] == "tool"]
+    tools = sorted((i for i in steps.items if i["kind"] == "tool"), key=lambda item: item["seq"])
+    sequences = [item["seq"] for item in tools]
     for edit in edits:
         key = call_key(edit)
         step = steps.calls.get(key)
@@ -460,8 +462,8 @@ def attach(steps, edits):
             step = steps.calls.get(head)
         if step is None and tools:
             # No matching call id: the last step at or before the edit's record.
-            before = [t for t in tools if t["seq"] <= (edit.get("seq") or 0)]
-            step = before[-1] if before else tools[0]
+            index = bisect_right(sequences, edit.get("seq") or 0) - 1
+            step = tools[max(index, 0)]
         if step is not None:
             step["edits"].append({"id": edit["id"], "path": edit["path"]})
 

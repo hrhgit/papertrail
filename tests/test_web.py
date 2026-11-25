@@ -75,7 +75,7 @@ def test_tracks_show_every_session_crossing_a_line(store):
     assert [lane["session"] for lane in by_start[2]["lanes"]][:3] == ["cedar", "birch", "amber"]
     assert by_start[2]["lanes"][0]["depth"] == 0
     assert by_start[1]["kind"] == "drift" and by_start[3]["kind"] == "external"
-    assert any("REPLACED*0.." in c for c in view["cypher"])
+    assert any("-[:REPLACED]->" in c for c in view["cypher"])
 
 
 def test_overview(store):

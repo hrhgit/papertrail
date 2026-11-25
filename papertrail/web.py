@@ -7,19 +7,25 @@ build its history) are POSTs that need a custom header, so other sites can't
 trigger them. The same goes for showing the system folder dialog.
 """
 
+import codecs
 import json
 import os
 import re
 import secrets
+import select as socket_select
 import shutil
+import socket
 import subprocess
 import sys
 import threading
 import time
 import traceback
 import webbrowser
+from bisect import bisect_right
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.resources import files as package_files
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -27,7 +33,7 @@ from urllib.parse import parse_qs, urlparse
 import relate
 
 from .graph import build, portable_root, select
-from .queries import Queries
+from .queries import Queries, file_version
 from .sources import DEFAULT_LOGS, SOURCES, ReadProgress, load_sources
 from .transcript import conversation, written_diff
 
@@ -36,14 +42,15 @@ MAX_FILE_BYTES = 2_000_000
 MAX_TREE = 20_000
 MAX_DIRS = 1_000
 LOOPBACK = {"127.0.0.1", "localhost", "[::1]"}
-# Search stops at whichever comes first, so one request can't hold the single
-# serving thread for long.
+# Keep the existing search result and scan limits.
 SEARCH_SECONDS = 2.0
 SEARCH_HITS = 400
 SEARCH_FILE_HITS = 40
 SEARCH_ROWS = 60
 SNIPPET = 200
 LEAD = 24
+TREE_CACHE_SECONDS = 1.0
+CONVERSATION_CACHE_SIZE = 8
 # Folders an editor's explorer would hide or that hold generated files.
 SKIP_DIRS = {
     ".git", ".hg", ".svn", ".papertrail", ".venv", "venv", "node_modules", "__pycache__",
@@ -72,18 +79,6 @@ RETURN s.id AS id, s.agent AS agent, s.model AS model, s.title AS title,
 s.started_at AS started_at, s.ended_at AS ended_at, s.cwd AS cwd, parent.id AS parent,
 count(e) AS edits ORDER BY started_at, id"""
 
-# One row per current line range. `lanes` lists every session whose edit is on the
-# range's REPLACED lineage, nearest first: the lines that cross at this spot.
-TRACKS = """
-MATCH (f:File {id:$path})-[:HAS_RANGE]->(r:Range)-[:FROM]->(owner:Hunk)
-OPTIONAL MATCH chain=(owner)-[:REPLACED*0..]->(h:Hunk)
-OPTIONAL MATCH (h)<-[:HAS_HUNK]-(:Edit)<-[:HAS_EDIT]-(s:Session)
-WITH r, owner, s, min(length(chain)) AS depth
-ORDER BY r.start, depth
-WITH r, owner, collect(CASE WHEN s IS NULL THEN NULL ELSE {session: s.id, depth: depth} END) AS lanes
-RETURN r.start AS start, r.end AS end, owner.kind AS kind, owner.id AS hunk, owner.ts AS ts, lanes
-ORDER BY start"""
-
 # One row per deletion still between two current lines. `after` counts the lines
 # above the spot. `wrote` lists who wrote the deleted lines and how many each.
 GAPS = """
@@ -97,6 +92,9 @@ RETURN g.id AS id, g.after AS after, h.id AS hunk, h.kind AS kind, h.ts AS ts,
 h.removed AS removed, h.removed_text AS text, e.id AS edit, s.id AS session, wrote
 ORDER BY after, ts, id"""
 
+DELETED_TEXT = """
+MATCH (:File {id:$path})-[:HAS_GAP]->(g:Gap {id:$id})-[:FROM]->(h:Hunk)
+RETURN h.removed_text AS text"""
 
 CONVERSATION_SESSION = """
 MATCH (s:Session {id:$id})
@@ -220,7 +218,11 @@ def definer(name):
     return lambda text: bool(defines.search(text))
 
 
-def search_files(paths, query, case, deadline, word=False):
+class SearchCancelled(Exception):
+    pass
+
+
+def search_files(paths, query, case, deadline, word=False, check=None):
     """Lines containing `query` in the readable text files among `paths`.
 
     Returns one entry per file with hits, and whether the search stopped early.
@@ -230,14 +232,24 @@ def search_files(paths, query, case, deadline, word=False):
     find = finder(query, case, word)
     defines = definer(query) if word else None
     found, total = [], 0
+
+    def expired():
+        if check:
+            check()
+        return time.monotonic() > deadline
+
     for path in paths:
-        if total >= SEARCH_HITS or time.monotonic() > deadline:
+        if total >= SEARCH_HITS or expired():
             return found, True
-        lines, _ = read_lines(path)
+        lines, _ = read_lines(path, expired)
+        if expired():
+            return found, True
         if not lines:
             continue
         hits = []
         for n, text in enumerate(lines, 1):
+            if n % 128 == 1 and expired():
+                return found, True
             at = find(text)
             if at < 0:
                 continue
@@ -255,45 +267,208 @@ def search_files(paths, query, case, deadline, word=False):
     return found, False
 
 
-def read_lines(path):
+def search_result(query, case, word, files, truncated, ranges, prompts, removed, statements, check):
+    for file in files:
+        if check:
+            check()
+        rows = ranges.get(file["path"], [])
+        # After an edit outside the build, the graph's line numbers no longer fit.
+        lines = file.pop("lines")
+        file["tracked"] = bool(rows)
+        file["stale"] = bool(rows) and rows[0]["lines"] != lines
+        if not rows or file["stale"]:
+            continue
+        rows.sort(key=lambda row: row["start"])
+        starts = [row["start"] for row in rows]
+        for hit in file["hits"]:
+            index = bisect_right(starts, hit["line"]) - 1
+            if index >= 0 and hit["line"] <= rows[index]["end"]:
+                owner = rows[index]
+                hit["kind"], hit["session"] = owner["kind"], owner["session"]
+
+    find = finder(query, case, word)
+    for row in prompts:
+        if check:
+            check()
+        flat = " ".join(row.pop("text").split())
+        at = find(flat)
+        # A match across a line break is still a hit; show the start instead.
+        row.update(clip(flat, at, len(query)) if at >= 0 else {**clip(flat, 0, 0), "size": 0})
+
+    deleted = []
+    for row in removed:
+        if check:
+            check()
+        lines = row.pop("text").split("\n")
+        for n, line in enumerate(lines):
+            if len(deleted) >= SEARCH_ROWS:
+                break
+            if check and n % 128 == 0:
+                check()
+            at = find(line)
+            if at >= 0:
+                deleted.append({**row, **clip(line, at, len(query))})
+
+    return {
+        "query": query,
+        "case": case,
+        "word": word,
+        "files": files,
+        "prompts": prompts,
+        "deleted": deleted,
+        "truncated": truncated,
+        "cypher": statements,
+    }
+
+
+def read_lines(path, expired=None):
     """The file's lines for display, or None and the reason it can't be shown."""
     try:
-        data = Path(path).read_bytes()
-        if len(data) > MAX_FILE_BYTES:
-            return None, "File is too large to display."
+        with Path(path).open("rb") as stream:
+            if os.fstat(stream.fileno()).st_size > MAX_FILE_BYTES:
+                return None, "File is too large to display."
+            data = bytearray()
+            while True:
+                if expired and expired():
+                    return None, None
+                chunk = stream.read(65536)
+                if not chunk:
+                    break
+                data.extend(chunk)
+                if len(data) > MAX_FILE_BYTES:
+                    return None, "File is too large to display."
         text = data.decode("utf-8")
     except FileNotFoundError:
         return None, "No longer on disk"
     except (OSError, UnicodeError):
         return None, "Not UTF-8 text"
+    return display_lines(text), None
+
+
+def display_lines(text):
     lines = text.replace("\r\n", "\n").split("\n")
     if lines and lines[-1] == "":
         lines.pop()
-    return lines, None
+    return lines
 
 
-def plain_file(file, root):
+def read_window(path, start, end):
+    """Count lines in blocks while keeping only the requested UTF-8 text."""
+    decoder = codecs.getincrementaldecoder("utf-8")()
+    picked, number, last = bytearray(), 1, b""
+    oversized = False
+    try:
+        with Path(path).open("rb") as stream:
+            while chunk := stream.read(65536):
+                decoder.decode(chunk)
+                last = chunk[-1:]
+                pieces = chunk.split(b"\n")
+                lo = max(0, start - number)
+                hi = len(pieces) if end is None else min(len(pieces), end - number + 1)
+                if not oversized and lo < hi:
+                    picked.extend(b"\n".join(pieces[lo:hi]))
+                    if hi < len(pieces):
+                        picked.extend(b"\n")
+                    oversized = len(picked) > MAX_FILE_BYTES
+                    if oversized:
+                        picked.clear()
+                number += len(pieces) - 1
+        decoder.decode(b"", final=True)
+    except FileNotFoundError:
+        return None, None, "No longer on disk"
+    except (OSError, UnicodeError):
+        return None, None, "Not UTF-8 text"
+    total = number - int(last in (b"", b"\n"))
+    if oversized:
+        return None, total, "File is too large to display."
+    return display_lines(picked.decode("utf-8")), total, None
+
+
+def plain_file_history(file, root):
     """A file in the open folder, shown with no history."""
     path = Path(file).expanduser().resolve()
     if not (root and path.is_relative_to(root) and path.is_file()):
         raise ValueError("No history for this folder yet. Build it first.")
-    lines, note = read_lines(path)
     return {
         "path": str(path),
         "status": "untracked",
-        "line_count": len(lines) if lines is not None else None,
-        "lines": lines,
-        "note": note,
+        "line_count": None,
         "tracks": [],
         "gaps": [],
         "cypher": [],
     }
 
 
+def file_view(view, window):
+    lines = total = note = None
+    status, snapshot = view["status"], view["line_count"]
+    if status in ("missing", "unreadable"):
+        note = f"{status.capitalize()} when the history was built"
+    elif window is None:
+        lines, note = read_lines(view["path"])
+        total = len(lines) if lines is not None else None
+    else:
+        start, end = window
+        lines, total, note = read_window(view["path"], start, end)
+    if total is not None and status != "untracked" and total != snapshot and note is None:
+        note = f"Changed since the build: {snapshot} → {total} lines"
+    result = {
+        "path": view["path"],
+        "status": status,
+        "line_count": total if status == "untracked" else snapshot,
+        "lines": lines,
+        "note": note,
+        "tracks": view["tracks"],
+        "gaps": view["gaps"],
+        "cypher": view["cypher"],
+    }
+    if window is not None:
+        result["total_lines"] = total
+    return result
+
+
+def log_version(path):
+    try:
+        return file_version(Path(path).stat()) if path else None
+    except OSError:
+        return None
+
+
+def remember(cache, key, value):
+    cache[key] = value
+    cache.move_to_end(key)
+    if len(cache) > CONVERSATION_CACHE_SIZE:
+        cache.popitem(last=False)
+
+
+def conversation_view(info, load_hunks):
+    session, edits, fate, statements = info
+    body = conversation(session, edits)
+    if fill_written_diffs(body["items"], load_hunks):
+        # This statement explains the graph-backed tool diffs in the response.
+        statements = [*statements[:3], EDIT_HUNKS.strip(), *statements[3:]]
+    return {"session": session, "edits": edits, **body, **fate, "cypher": statements}
+
+
+def fill_written_diffs(items, load_hunks):
+    bare = [i for i in items if i["kind"] == "tool" and i["edits"] and not i.get("diff")]
+    ids = list(dict.fromkeys(e["id"] for i in bare for e in i["edits"]))
+    if not ids:
+        return False
+    hunks = load_hunks(ids)
+    for item in bare:
+        item["diff"], item["diff_more"] = written_diff(item["edits"], hunks)
+        item["diff_from_graph"] = bool(item["diff"])
+    return True
+
+
 class ReaderQueries(Queries):
     """Views the web reader needs on top of the CLI query API."""
 
     def overview(self):
+        if hasattr(self, "_overview"):
+            self.statements[:] = self._overview["cypher"]
+            return self._overview
         self._begin()
         stats = self._stats()
         files = self._run(FILES)
@@ -304,7 +479,7 @@ class ReaderQueries(Queries):
             row["written"] = written.get(row["id"]) or 0
             row["alive"] = alive.get(row["id"]) or 0
         crossings = self._crossings(None, limit=200)
-        return {
+        self._overview = {
             "stats": stats,
             "files": files,
             "sessions": sessions,
@@ -313,35 +488,41 @@ class ReaderQueries(Queries):
             "home": str(Path.home()),
             "cypher": crossings["cypher"],
         }
+        return self._overview
 
     def conversation(self, session_id):
         """A session's conversation from its log, each step marked with the edits it made."""
+        return conversation_view(self.conversation_info(session_id), self.conversation_hunks)
+
+    def conversation_info(self, session_id):
+        cache = self.__dict__.setdefault("conversations", OrderedDict())
+        if session_id in cache:
+            cache.move_to_end(session_id)
+            return cache[session_id]
         self._begin()
         rows = self._run(CONVERSATION_SESSION, id=session_id)
         if not rows:
             raise ValueError("Session missing. Use the full ID from blame or trace.")
         session = rows[0]
         edits = self._run(CONVERSATION_EDITS, id=session_id)
-        try:
-            stat = Path(session["log_path"]).stat()
-            key = (session_id, stat.st_mtime_ns, stat.st_size)
-        except (OSError, TypeError):
-            key = None
-        cache = self.__dict__.setdefault("conversations", {})
-        body = cache.get(key) if key else None
-        if body is None:
-            body = conversation(session, edits)
-            self._written(body["items"])
-            if key:
-                cache[key] = body
-                while len(cache) > 8:
-                    cache.pop(next(iter(cache)))
         fate = {
             "replaced": self._run(REPLACED_BY, id=session_id),
             "alive_in": self._run(ALIVE_IN, id=session_id),
             "unaccounted": self._run(UNACCOUNTED, id=session_id),
         }
-        return {"session": session, "edits": edits, **body, **fate, "cypher": list(self.statements)}
+        info = session, edits, fate, list(self.statements)
+        remember(cache, session_id, info)
+        return info
+
+    def conversation_hunks(self, ids):
+        self.statements.clear()
+        hunks = {}
+        for row in self._run(EDIT_HUNKS, ids=ids):
+            hunks.setdefault(row["edit"], []).append(row)
+        return hunks
+
+    def _written(self, items):
+        fill_written_diffs(items, self.conversation_hunks)
 
     def span(self, file, start, end):
         """The history of a span of lines, such as one function: one stop per
@@ -375,114 +556,71 @@ class ReaderQueries(Queries):
             stop["edits"] = len(stop["edits"])
         return {"path": path, "start": start, "end": end, "rows": rows, "cypher": list(self.statements)}
 
-    def search(self, query, case=False, paths=(), word=False):
-        """Current lines, instructions and deleted lines that contain `query`.
-
-        `paths` are the open folder's files. Files in the graph outside it are
-        searched too. Each current-line hit says who wrote the line. With `word`
-        this looks up a name's uses in code, so instructions are left out.
-        """
+    def search_paths(self):
+        if hasattr(self, "_search_paths"):
+            return self._search_paths
         self._begin()
-        deadline = time.monotonic() + SEARCH_SECONDS
-        known = dict.fromkeys(str(p) for p in paths)
-        for row in self._run("MATCH (f:File) RETURN f.path AS path ORDER BY path"):
-            known.setdefault(row["path"])
-        files, truncated = search_files(known, query, case, deadline, word)
+        rows = self._run("MATCH (f:File) RETURN f.path AS path ORDER BY path")
+        self._search_paths = [r["path"] for r in rows], list(self.statements)
+        return self._search_paths
 
+    def search_history(self, query, case, word, files, statements, check):
+        self.statements[:] = statements
         ranges = {}
+        if check:
+            check()
         for row in self._run(SEARCH_OWNERS, paths=[f["path"] for f in files]) if files else []:
             ranges.setdefault(row["path"], []).append(row)
-        for file in files:
-            rows = ranges.get(file["path"], [])
-            # After an edit outside the build, the graph's line numbers no longer fit.
-            lines = file.pop("lines")
-            file["tracked"] = bool(rows)
-            file["stale"] = bool(rows) and rows[0]["lines"] != lines
-            if not rows or file["stale"]:
-                continue
-            for hit in file["hits"]:
-                owner = next((r for r in rows if r["start"] <= hit["line"] <= r["end"]), None)
-                if owner:
-                    hit["kind"], hit["session"] = owner["kind"], owner["session"]
-
-        find = finder(query, case, word)
-        needle = query if case else query.lower()
-        prompts = []
+        if check:
+            check()
         text = "p.text" if case else "toLower(p.text)"
-        for row in [] if word else self._run(SEARCH_PROMPTS.format(text=text), q=needle, cap=SEARCH_ROWS):
-            flat = " ".join(row.pop("text").split())
-            at = find(flat)
-            # A match across a line break is still a hit; show the start instead.
-            row.update(clip(flat, at, len(query)) if at >= 0 else {**clip(flat, 0, 0), "size": 0})
-            prompts.append(row)
-
-        deleted = []
+        needle = query if case else query.lower()
+        prompts = [] if word else self._run(SEARCH_PROMPTS.format(text=text), q=needle, cap=SEARCH_ROWS)
+        if check:
+            check()
         text = "h.removed_text" if case else "toLower(h.removed_text)"
-        for row in self._run(SEARCH_DELETED.format(text=text), q=needle, cap=SEARCH_ROWS):
-            lines = row.pop("text").split("\n")
-            for line in lines:
-                at = find(line)
-                if at >= 0 and len(deleted) < SEARCH_ROWS:
-                    deleted.append({**row, **clip(line, at, len(query))})
+        deleted = self._run(SEARCH_DELETED.format(text=text), q=needle, cap=SEARCH_ROWS)
+        return ranges, prompts, deleted, list(self.statements)
 
-        return {
-            "query": query,
-            "case": case,
-            "word": word,
-            "files": files,
-            "prompts": prompts,
-            "deleted": deleted,
-            "truncated": truncated,
-            "cypher": list(self.statements),
-        }
+    def file(self, file, root=None, window=None, deleted=True):
+        return file_view(self.file_history(file, root, window, deleted), window)
 
-    def _written(self, items):
-        """Steps that wrote lines without a diff in the log get one from the graph."""
-        bare = [i for i in items if i["kind"] == "tool" and i["edits"] and not i.get("diff")]
-        ids = list(dict.fromkeys(e["id"] for i in bare for e in i["edits"]))
-        if not ids:
-            return
-        hunks = {}
-        for row in self._run(EDIT_HUNKS, ids=ids):
-            hunks.setdefault(row["edit"], []).append(row)
-        for item in bare:
-            item["diff"], item["diff_more"] = written_diff(item["edits"], hunks)
-            item["diff_from_graph"] = bool(item["diff"])
-
-    def file(self, file, root=None):
+    def file_history(self, file, root, window, deleted):
         """One file with its tracks. Inside `root`, a file no agent touched is still
         shown, with no tracks, the way an editor opens any file in the folder."""
         self._begin()
         try:
             path, info = self._file(file)
         except ValueError:
-            path = Path(file).expanduser().resolve()
-            if not (root and path.is_relative_to(root) and path.is_file()):
-                raise
-            path, info = str(path), {"status": "untracked", "lines": None}
-        tracked = info["status"] != "untracked"
-        tracks = self._run(TRACKS, path=path) if tracked else []
-        gaps = self._run(GAPS, path=path) if tracked else []
-        lines, note = None, None
-        if info["status"] in ("missing", "unreadable"):
-            note = f"{info['status'].capitalize()} when the history was built"
-        else:
-            lines, note = read_lines(path)
-        if lines is not None:
-            if info["status"] == "untracked":
-                info["lines"] = len(lines)
-            elif len(lines) != info["lines"]:
-                note = f"Changed since the build: {info['lines']} → {len(lines)} lines"
+            try:
+                return plain_file_history(file, root) | {"cypher": list(self.statements)}
+            except ValueError:
+                pass
+            raise
+        start, end = window or (None, None)
+        tracks = self._tracks(path, start, end)
+        gaps_query = GAPS if deleted else GAPS.replace("h.removed_text AS text", "NULL AS text")
+        if window:
+            gaps_query = gaps_query.replace("OPTIONAL MATCH", """
+WHERE g.after >= $start - 1 AND ($end IS NULL OR g.after <= $end)
+OPTIONAL MATCH""", 1)
+        gaps = self._run(gaps_query, path=path, start=start, end=end)
         return {
             "path": path,
             "status": info["status"],
             "line_count": info["lines"],
-            "lines": lines,
-            "note": note,
             "tracks": tracks,
             "gaps": gaps,
             "cypher": list(self.statements),
         }
+
+    def deleted(self, file, gap_id):
+        self._begin()
+        path = str(Path(file).expanduser().resolve())
+        rows = self._run(DELETED_TEXT, path=path, id=gap_id)
+        if not rows:
+            raise ValueError("Deletion missing for this file.")
+        return {"path": path, "id": gap_id, "text": rows[0]["text"], "cypher": list(self.statements)}
 
 
 class BuildCancelled(Exception):
@@ -595,9 +733,14 @@ class Reader:
     def __init__(self, store=None, project=None):
         self.store = Path(store).expanduser().resolve() if store else None
         self.project = Path(project).expanduser().resolve() if project else None
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
+        self.db_worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="papertrail-db")
+        self.closed = False
         self.queries = None
-        self.mtime = None
+        self.graph_version = None
+        self.tree_lock = threading.Lock()
+        self.tree_cache = None
+        self.conversation_bodies = OrderedDict()
         self.folders_cache = None
         self.job = None
         # A store given on the command line stays tied to its folder when the
@@ -609,66 +752,141 @@ class Reader:
         return bool(self.job and self.job.running)
 
     def call(self, method, *args, **kwargs):
+        return self._submit_query(method, args, kwargs).result()[0]
+
+    def _require_history(self):
+        if self.closed:
+            raise ValueError("The reader is shutting down.")
+        if self.building:
+            raise ValueError("History is still building. Try again when it finishes.")
+        if self.store is None or not self.store.is_file():
+            raise ValueError("No history for this folder yet. Build it first.")
+
+    def _submit_query(self, method, args=(), kwargs=None, *, store=None, version=None, check=None):
         with self.lock:
-            if self.building:
-                raise ValueError("History is still building. Try again when it finishes.")
-            if self.store is None or not self.store.is_file():
-                raise ValueError("No history for this folder yet. Build it first.")
-            mtime = self.store.stat().st_mtime_ns
-            if self.queries is None or mtime != self.mtime:
-                self._close()
-                self.queries = ReaderQueries(self.store)
-                self.mtime = mtime
-            return getattr(self.queries, method)(*args, **kwargs)
+            self._require_history()
+            if store is not None and store != self.store:
+                raise ValueError("History changed during the request. Try again.")
+            return self.db_worker.submit(self._query, self.store, method, args, kwargs or {}, version, check)
 
-    def file(self, path):
-        if self.building or self.store is None or not self.store.is_file():
-            # Before the first build, and during a rebuild, the folder still opens
-            # like an editor would, as plain files with no tracks.
-            return plain_file(path, self.project)
-        return self.call("file", path, root=self.project)
+    def overview(self):
+        with self.lock:
+            project = str(self.project) if self.project else None
+            task = self._submit_query("overview")
+        return task.result()[0] | {"project": project}
 
-    def search(self, query, case=False, word=False):
+    @staticmethod
+    def _store_version(store):
+        try:
+            return store, file_version(store.stat())
+        except FileNotFoundError:
+            raise ValueError("No history for this folder yet. Build it first.") from None
+
+    def _query(self, store, method, args, kwargs, version=None, check=None):
+        if check:
+            check()
+        current = self._store_version(store)
+        if version is not None and current != version:
+            raise ValueError("History changed during the request. Try again.")
+        if current != self.graph_version:
+            self._close()
+            self.queries = ReaderQueries(store)
+            self.graph_version = current
+        return getattr(self.queries, method)(*args, **kwargs), current
+
+    def file(self, path, window=None, deleted=True):
+        with self.lock:
+            root = self.project
+            args = (path, root, window, deleted)
+            task = self._submit_query("file_history", args) if self._ready() else None
+        history = task.result()[0] if task else plain_file_history(path, root)
+        return file_view(history, window)
+
+    def conversation_bytes(self, session_id):
+        with self.lock:
+            self._require_history()
+            key = (self._store_version(self.store), session_id)
+            cached = self.conversation_bodies.get(key)
+            if cached:
+                path, version, body = cached
+                if log_version(path) == version:
+                    self.conversation_bodies.move_to_end(key)
+                    return body
+            task = self._submit_query("conversation_info", (session_id,))
+        info, version = task.result()
+        path = info[0]["log_path"]
+        log = log_version(path)
+
+        def load_hunks(ids):
+            task = self._submit_query("conversation_hunks", (ids,), store=version[0], version=version)
+            return task.result()[0]
+
+        view = conversation_view(info, load_hunks)
+        body = json.dumps(view).encode()
+        if log is not None and log == log_version(path) and view["note"] != "The log for this session could not be read.":
+            with self.lock:
+                remember(self.conversation_bodies, (version, session_id), (path, log, body))
+        return body
+
+    def search(self, query, case=False, word=False, check=None):
         query = query.strip("\r\n")
         if not query.strip():
             raise ValueError("Type something to search for.")
         if len(query) > 200:
             raise ValueError("Search for 200 characters or fewer.")
-        paths = [self.project / name for name in list_files(self.project)[0]] if self.project else []
-        if self.building or self.store is None or not self.store.is_file():
-            # Without a graph this is a plain text search of the folder.
-            files, truncated = search_files(paths, query, case, time.monotonic() + SEARCH_SECONDS, word)
-            for file in files:
-                file.pop("lines")
-                file.update(tracked=False, stale=False)
-            return {"query": query, "case": case, "word": word, "files": files, "prompts": [], "deleted": [],
-                    "truncated": truncated, "cypher": []}
-        return self.call("search", query, case, paths, word)
+        if check:
+            check()
+        with self.lock:
+            root, store = self.project, self.store if self._ready() else None
+        paths = dict.fromkeys(str(root / name) for name in self._listed(root)[0]) if root else {}
+        deadline = time.monotonic() + SEARCH_SECONDS
+        statements, history = [], ({}, [], [], [])
+        if store:
+            task = self._submit_query("search_paths", store=store, check=check)
+            (graph_paths, statements), version = task.result()
+            for path in graph_paths:
+                paths.setdefault(path)
+        hits, truncated = search_files(paths, query, case, deadline, word, check)
+        if check:
+            check()
+        if store:
+            args = (query, case, word, hits, statements, check)
+            task = self._submit_query("search_history", args, store=store, version=version, check=check)
+            history, _ = task.result()
+        return search_result(query, case, word, hits, truncated, *history, check)
+
+    def _ready(self):
+        return bool(self.store and self.store.is_file()) and not (self.building or self.closed)
 
     def workspace(self):
-        return {
-            "project": str(self.project) if self.project else None,
-            "store": str(self.store) if self.store else None,
-            "ready": bool(self.store and self.store.is_file()) and not self.building,
-            "building": self.building,
-            "home": str(Path.home()),
-        }
+        with self.lock:
+            return {
+                "project": str(self.project) if self.project else None,
+                "store": str(self.store) if self.store else None,
+                "ready": self._ready(),
+                "building": self.building,
+                "home": str(Path.home()),
+            }
 
     def open(self, folder):
         folder = Path(folder).expanduser().resolve()
-        if self.building:
-            raise ValueError("Wait for the history build to finish, then open another folder.")
         if not folder.is_dir():
             raise ValueError("Folder missing. Pick an existing folder.")
         with self.lock:
-            self._close()
+            if self.closed:
+                raise ValueError("The reader is shutting down.")
+            if self.building:
+                raise ValueError("Wait for the history build to finish, then open another folder.")
+            if folder != self.project:
+                self.db_worker.submit(self._close)
             self.project, self.store = folder, self.known.get(folder) or store_for(folder)
-        return self.workspace()
+            return self.workspace()
 
     def build(self, folder, roots=None):
         """Same as `papertrail ingest --project FOLDER` with the default log roots,
         run to the end on this thread."""
-        job = self._new_job(folder, roots)
+        with self.lock:
+            job = self._new_job(folder, roots)
         job.run()
         if job.error:
             raise job.error
@@ -677,44 +895,56 @@ class Reader:
     def start_build(self, folder, roots=None):
         """Start the same build on a worker thread. Poll `build_status` for progress.
         Asking again for the folder already building returns its progress."""
-        if self.building:
-            if Path(folder).expanduser().resolve() == self.job.project:
-                return self.build_status()
-            raise ValueError("Another folder's history is building. Wait for it to finish.")
-        job = self._new_job(folder, roots)
-        threading.Thread(target=job.run, name="papertrail-build", daemon=True).start()
-        return self.build_status()
+        with self.lock:
+            if self.building:
+                if Path(folder).expanduser().resolve() == self.job.project:
+                    return self.build_status()
+                raise ValueError("Another folder's history is building. Wait for it to finish.")
+            job = self._new_job(folder, roots)
+            threading.Thread(target=job.run, name="papertrail-build", daemon=True).start()
+            return self.build_status()
 
     def build_status(self):
-        if self.job is None:
-            return {"running": False, "stage": None}
-        status = self.job.status()
-        if status["stage"] == "done":
-            status["result"] = {
-                **self.workspace(),
-                "sessions": self.job.kept,
-                "sessions_read": self.job.read_sessions,
-                "seconds": status["elapsed"],
-            }
-        return status
+        with self.lock:
+            if self.job is None:
+                return {"running": False, "stage": None}
+            status = self.job.status()
+            if status["stage"] == "done":
+                status["result"] = {
+                    **self.workspace(),
+                    "sessions": self.job.kept,
+                    "sessions_read": self.job.read_sessions,
+                    "seconds": status["elapsed"],
+                }
+            return status
 
     def _new_job(self, folder, roots):
         self.open(folder)
         roots = roots or {name: Path.home() / DEFAULT_LOGS[name] for name in SOURCES}
         # A portable folder carries its own logs, as the bundled demo does.
-        shipped = portable_root(self.store) if self.store else None
+        shipped = self.db_worker.submit(portable_root, self.store).result() if self.store else None
         if shipped and (shipped / "logs").is_dir():
             roots = {"claude-code": shipped / "logs/claude", "codex": shipped / "logs/codex"}
-        with self.lock:
-            self._close()
-            self.job = BuildJob(self.project, self.store, roots)
+        self.db_worker.submit(self._close)
+        self.job = BuildJob(self.project, self.store, roots)
         return self.job
 
     def tree(self):
-        if self.project is None:
+        with self.lock:
+            root = self.project
+        if root is None:
             return {"root": None, "files": [], "truncated": False}
-        files, truncated = list_files(self.project)
-        return {"root": str(self.project), "files": files, "truncated": truncated}
+        files, truncated = self._listed(root)
+        return {"root": str(root), "files": list(files), "truncated": truncated}
+
+    def _listed(self, root):
+        with self.tree_lock:
+            now = time.monotonic()
+            if self.tree_cache and self.tree_cache[0] == root and now < self.tree_cache[1]:
+                return self.tree_cache[2]
+            result = list_files(root)
+            self.tree_cache = (root, time.monotonic() + TREE_CACHE_SECONDS, result)
+            return result
 
     def folders(self):
         if self.folders_cache is None or time.monotonic() - self.folders_cache[0] > 60:
@@ -725,15 +955,23 @@ class Reader:
         if self.queries is not None:
             self.queries.db.close()
             self.queries = None
-            self.mtime = None
+            self.graph_version = None
 
     def close(self):
-        # Stop a build between two log files, so its private staging folder is removed.
-        if self.building:
-            self.job.cancelled = True
-            self.job.ended.wait(15)
         with self.lock:
-            self._close()
+            if self.closed:
+                return
+            self.closed = True
+            job = self.job if self.building else None
+            task = self.db_worker.submit(self._close)
+        # Stop a build between two log files, so its private staging folder is removed.
+        if job:
+            job.cancelled = True
+            job.ended.wait(15)
+        try:
+            task.result()
+        finally:
+            self.db_worker.shutdown()
 
 
 def list_files(root):
@@ -978,6 +1216,16 @@ def handler(reader):
             self.send_error(HTTPStatus.CONFLICT, "The server changed. Reload this page.")
             return False
 
+        def check_search_client(self):
+            # The request is fully read. A readable socket with no bytes left
+            # means the browser closed it while the search was running.
+            try:
+                readable, _, _ = socket_select.select([self.connection], [], [], 0)
+                if readable and not self.connection.recv(1, socket.MSG_PEEK):
+                    raise SearchCancelled
+            except (ConnectionError, OSError):
+                raise SearchCancelled from None
+
         def do_POST(self):
             if not self.local():
                 return
@@ -1032,10 +1280,13 @@ def handler(reader):
                 if name == "workspace":
                     result = reader.workspace()
                 elif name == "overview":
-                    result = reader.call("overview")
-                    result["project"] = reader.workspace()["project"]
+                    result = reader.overview()
                 elif name == "file":
-                    result = reader.file(need(params, "path"))
+                    result = reader.file(
+                        need(params, "path"), file_window(params), deleted=params.get("deleted") != "0",
+                    )
+                elif name == "deleted":
+                    result = reader.call("deleted", need(params, "path"), need(params, "id"))
                 elif name == "tree":
                     result = reader.tree()
                 elif name == "browse":
@@ -1045,7 +1296,10 @@ def handler(reader):
                 elif name == "build":
                     result = reader.build_status()
                 elif name == "search":
-                    result = reader.search(need(params, "q"), params.get("case") == "1", params.get("word") == "1")
+                    result = reader.search(
+                        need(params, "q"), params.get("case") == "1", params.get("word") == "1",
+                        check=self.check_search_client,
+                    )
                 elif name == "blame":
                     result = reader.call("blame", need(params, "path"))
                 elif name == "trace":
@@ -1061,10 +1315,13 @@ def handler(reader):
                 elif name == "session":
                     result = reader.call("session", need(params, "id"), 2000)
                 elif name == "conversation":
-                    result = reader.call("conversation", need(params, "id"))
+                    body = reader.conversation_bytes(need(params, "id"))
+                    return self.send(HTTPStatus.OK, body, "application/json; charset=utf-8")
                 else:
                     return self.send_error(HTTPStatus.NOT_FOUND, "Unknown endpoint.")
                 self.json(HTTPStatus.OK, result)
+            except SearchCancelled:
+                self.close_connection = True
             except ValueError as exc:
                 self.json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             except relate.Error as exc:
@@ -1083,21 +1340,31 @@ def need(params, key):
     return value
 
 
+def file_window(params):
+    if "from" not in params and "to" not in params:
+        return None
+    first, last = params.get("from", "1"), params.get("to")
+    if not first.isdecimal() or (last is not None and not last.isdecimal()):
+        raise ValueError("Use positive line numbers.")
+    start, end = int(first), int(last) if last is not None else None
+    if start < 1 or (end is not None and end < start) or (end or start) >= 2**63:
+        raise ValueError("Use an ascending range of positive line numbers.")
+    return start, end
+
+
 def serve(store=None, host="127.0.0.1", port=8765, open_browser=True, project=None):
     reader = Reader(store, project)
-    if reader.workspace()["ready"]:
-        reader.call("overview")  # Fail fast on a foreign store.
-    # Single-threaded on purpose: a Relate connection must stay on the thread that opened it.
-    server = HTTPServer((host, port), handler(reader))
-    url = f"http://{host}:{server.server_address[1]}/"
-    where = f"store: {reader.store}" if reader.workspace()["ready"] else "no history yet, open or build one in the page"
-    print(f"Paper Trail reader on {url}  ({where})  Ctrl+C to stop.", flush=True)
-    if open_browser:
-        threading.Timer(0.3, webbrowser.open, (url,)).start()
     try:
-        server.serve_forever()
+        if reader.workspace()["ready"]:
+            reader.call("validate")
+        with ThreadingHTTPServer((host, port), handler(reader)) as server:
+            url = f"http://{host}:{server.server_address[1]}/"
+            where = f"store: {reader.store}" if reader.workspace()["ready"] else "no history yet, open or build one in the page"
+            print(f"Paper Trail reader on {url}  ({where})  Ctrl+C to stop.", flush=True)
+            if open_browser:
+                threading.Timer(0.3, webbrowser.open, (url,)).start()
+            server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
-        server.server_close()
         reader.close()
