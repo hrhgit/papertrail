@@ -10,6 +10,7 @@ Edit nodes, which is how a change found in the graph lands on its exact step.
 """
 
 import json
+import os
 import re
 from bisect import bisect_right
 from pathlib import Path
@@ -23,6 +24,7 @@ INPUT_LIMIT = 4_000
 OUTPUT_LIMIT = 2_000
 DIFF_LINES = 400
 MAX_STEPS = 6_000
+CONVERSATION_DEPENDENCY_LIMIT = 1_024
 
 
 def clip(text, limit):
@@ -178,9 +180,50 @@ def claude_diff(name, args):
     return rows or None
 
 
+def _claude_children_folder(log_path):
+    return log_path.with_suffix("") / "subagents"
+
+
+def conversation_version(session):
+    """Version the files used by a conversation without opening their contents."""
+
+    def stamp(stat):
+        return stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_dev, stat.st_ino
+
+    path = session.get("log_path")
+    if not path:
+        return None
+    path = Path(path)
+    try:
+        main = stamp(path.stat())
+        if session.get("agent") == "codex":
+            return main, None
+        if path.parent.name == "subagents":
+            try:
+                return main, stamp(path.with_suffix(".meta.json").stat())
+            except FileNotFoundError:
+                return main, None
+
+        children = []
+        try:
+            entries = os.scandir(_claude_children_folder(path))
+        except (FileNotFoundError, NotADirectoryError):
+            return main, ()
+        with entries:
+            for count, entry in enumerate(entries, 1):
+                # Large folders remain readable, but their responses aren't cached.
+                if count > CONVERSATION_DEPENDENCY_LIMIT:
+                    return None
+                if entry.name.endswith((".jsonl", ".meta.json")):
+                    children.append((entry.name, stamp(entry.stat())))
+        return main, tuple(children)
+    except OSError:
+        return None
+
+
 def claude_children(log_path, sid):
     """Helper sessions this session launched, by the tool call that launched them."""
-    folder = Path(log_path).with_suffix("") / "subagents"
+    folder = _claude_children_folder(Path(log_path))
     children = {}
     if not folder.is_dir():
         return children

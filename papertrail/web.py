@@ -35,7 +35,7 @@ import relate
 from .graph import build, portable_root, select
 from .queries import Queries, file_version
 from .sources import DEFAULT_LOGS, SOURCES, ReadProgress, load_sources
-from .transcript import conversation, written_diff
+from .transcript import conversation, conversation_version, written_diff
 
 STATIC = package_files("papertrail") / "static"
 MAX_FILE_BYTES = 2_000_000
@@ -74,10 +74,13 @@ count(DISTINCT e) AS edits, count(DISTINCT s) AS sessions ORDER BY path"""
 SESSIONS = """
 MATCH (s:Session)
 OPTIONAL MATCH (s)-[:HAS_EDIT]->(e:Edit)
-OPTIONAL MATCH (parent:Session)-[:SPAWNED]->(s)
 RETURN s.id AS id, s.agent AS agent, s.model AS model, s.title AS title,
-s.started_at AS started_at, s.ended_at AS ended_at, s.cwd AS cwd, parent.id AS parent,
+s.started_at AS started_at, s.ended_at AS ended_at, s.cwd AS cwd, null AS parent,
 count(e) AS edits ORDER BY started_at, id"""
+
+SESSION_PARENTS = """
+MATCH (s:Session)<-[:SPAWNED]-(parent:Session)
+RETURN s.id AS id, parent.id AS parent, count(*) AS links"""
 
 # One row per deletion still between two current lines. `after` counts the lines
 # above the spot. `wrote` lists who wrote the deleted lines and how many each.
@@ -427,13 +430,6 @@ def file_view(view, window):
     return result
 
 
-def log_version(path):
-    try:
-        return file_version(Path(path).stat()) if path else None
-    except OSError:
-        return None
-
-
 def remember(cache, key, value):
     cache[key] = value
     cache.move_to_end(key)
@@ -465,6 +461,18 @@ def fill_written_diffs(items, load_hunks):
 class ReaderQueries(Queries):
     """Views the web reader needs on top of the CLI query API."""
 
+    def _overview_sessions(self):
+        sessions = self._run(SESSIONS)
+        parents = {}
+        for row in self._run(SESSION_PARENTS):
+            parents.setdefault(row["id"], []).append((row["parent"], row["links"]))
+        # A repeated relationship contributed to count(e) once per link.
+        return [
+            row | {"parent": parent, "edits": row["edits"] * links}
+            for row in sessions
+            for parent, links in parents.get(row["id"], ((None, 1),))
+        ]
+
     def overview(self):
         if hasattr(self, "_overview"):
             self.statements[:] = self._overview["cypher"]
@@ -472,7 +480,7 @@ class ReaderQueries(Queries):
         self._begin()
         stats = self._stats()
         files = self._run(FILES)
-        sessions = self._run(SESSIONS)
+        sessions = self._overview_sessions()
         written = {row["id"]: row["written"] for row in self._run(WRITTEN)}
         alive = {row["id"]: row["alive"] for row in self._run(ALIVE)}
         for row in sessions:
@@ -808,14 +816,15 @@ class Reader:
             key = (self._store_version(self.store), session_id)
             cached = self.conversation_bodies.get(key)
             if cached:
-                path, version, body = cached
-                if log_version(path) == version:
+                session, log, body = cached
+                if conversation_version(session) == log:
                     self.conversation_bodies.move_to_end(key)
                     return body
+                self.conversation_bodies.pop(key)
             task = self._submit_query("conversation_info", (session_id,))
         info, version = task.result()
-        path = info[0]["log_path"]
-        log = log_version(path)
+        session = info[0]
+        log = conversation_version(session)
 
         def load_hunks(ids):
             task = self._submit_query("conversation_hunks", (ids,), store=version[0], version=version)
@@ -823,9 +832,9 @@ class Reader:
 
         view = conversation_view(info, load_hunks)
         body = json.dumps(view).encode()
-        if log is not None and log == log_version(path) and view["note"] != "The log for this session could not be read.":
+        if log is not None and log == conversation_version(session) and view["note"] != "The log for this session could not be read.":
             with self.lock:
-                remember(self.conversation_bodies, (version, session_id), (path, log, body))
+                remember(self.conversation_bodies, (version, session_id), (session, log, body))
         return body
 
     def search(self, query, case=False, word=False, check=None):
