@@ -5,14 +5,16 @@ import json
 import re
 import shlex
 from collections import Counter, defaultdict
+from contextlib import closing
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
-from ..logfile import ZstdUnavailable, compressed, log_stem, open_log
+from ..cache import stamp
+from ..logfile import ZstdUnavailable, compressed, compressed_read, log_stem, open_log, zstd_available
 from ..model import Edit, Hint, Prompt, Session
-from .claude import GIT_CONTENT, READ_CHUNK, other_agent, read_only
+from .claude import READ_CHUNK, git_content, other_agent, read_only
 from .codex_patch import (
     absolute,
     command_string,
@@ -24,6 +26,7 @@ from .codex_patch import (
     wrapper_command,
     wrapper_patch,
 )
+from .paths import cached_parse, observe_paths
 from .shell_write import ECHO_WRITE, shell_edits, shell_status
 
 
@@ -469,7 +472,7 @@ class Rollout:
         return edits
 
     def hint_command(self, cmd, cwd, turn, key, ts, status, tool, outer, *, native=False):
-        if status != "success" or read_only(cmd) or other_agent(cmd) or GIT_CONTENT.search(cmd):
+        if status != "success" or read_only(cmd) or other_agent(cmd) or git_content(cmd):
             return
         hint = Hint(
             f"{self.s.id}:hint:{key}", self.seq, ts, tool, cwd, cmd,
@@ -788,6 +791,21 @@ class Rollout:
                 self.prompt(payload_text(p["content"]), ts, tid)
 
 
+@dataclass
+class RolloutHeader:
+    stamp: tuple
+    sid: str | None
+    parent: str | None
+    failures: Counter
+    broken: bool
+
+
+def thread_spawn(payload):
+    source = payload.get("source")
+    subagent = source.get("subagent", {}) if isinstance(source, dict) else {}
+    return subagent.get("thread_spawn", {}) if isinstance(subagent, dict) else {}
+
+
 class CodexSource:
     def __init__(self):
         self.counts = Counter()
@@ -795,25 +813,41 @@ class CodexSource:
         self.skipped = Counter()
         self.tick = None
         self.broken = set()
+        self.check = None
 
     def raw_lines(self, path):
+        if self.check:
+            self.check()
         # Rollouts are append-only. Use the same byte boundary in the metadata
         # pass, the parsing pass and the independent receipt audit. A compressed
-        # rollout is finished, so it is read to the end, and progress counts it
-        # when it is done rather than by decompressed bytes.
+        # rollout is finished, so it is read to the end, and progress counts the
+        # compressed bytes the decoder has consumed.
         packed = compressed(path)
+        unreported = reported = 0
+        with closing(self._decoded_lines(path, packed)) as lines:
+            for stream, line in lines:
+                if self.check or self.tick:
+                    unreported += len(line)
+                    if unreported >= READ_CHUNK:
+                        if self.check:
+                            self.check()
+                        if self.tick:
+                            if not packed:
+                                self.tick(path, unreported)
+                            elif (done := compressed_read(stream)) is not None and done > reported:
+                                self.tick(path, done - reported)
+                                reported = done
+                        unreported = 0
+                yield line
+
+    def _decoded_lines(self, path, packed):
+        # Keep cancellation and progress callbacks outside decoder error handling.
         remaining = -1 if packed else self.log_sizes[path]
-        unreported = 0
         try:
             with open_log(path) as stream:
                 while remaining and (line := stream.readline(remaining)):
                     remaining -= len(line) if remaining > 0 else 0
-                    if self.tick and not packed:
-                        unreported += len(line)
-                        if unreported >= READ_CHUNK:
-                            self.tick(path, unreported)
-                            unreported = 0
-                    yield line
+                    yield stream, line
         except ZstdUnavailable:
             self.failures["compressed_rollout_without_zstd"] += 1
         except Exception as error:  # OSError, or a decoder's own error type
@@ -854,82 +888,153 @@ class CodexSource:
         root = Path(root).expanduser().resolve()
         return sorted([*root.rglob("rollout-*.jsonl"), *root.rglob("rollout-*.jsonl.zst")])
 
-    def sessions(self, root, progress=None):
-        batch, child_paths, launches = {}, {}, defaultdict(list)
+    def headers(self, paths, cache=None, check=None):
+        headers = {}
+        packed_cache = cache and cache.directory and any(map(compressed, paths)) and zstd_available()
+        for path in paths:
+            snapshot = stamp(path)
+            if snapshot is None:
+                if check:
+                    check()
+                headers[path] = None
+                continue
+            key = None
+            if cache and (packed_cache or not compressed(path)):
+                key = cache.entry("codex", [path], kind="header", stamps=(snapshot,))
+            header = cache.get(key) if key else None
+            if header is None:
+                unit = CodexSource()
+                unit.check = check
+                unit.log_sizes = {path: snapshot[1]}
+                sid, parent = None, None
+                for record in unit.records(path):
+                    payload = record["payload"]
+                    if record.get("type") == "session_meta" and isinstance(payload.get("id"), str):
+                        sid = payload["id"]
+                        spawn = thread_spawn(payload)
+                        value = spawn.get("parent_thread_id") if isinstance(spawn, dict) else None
+                        parent = value if isinstance(value, str) else None
+                        break
+                header = RolloutHeader(snapshot, sid, parent, unit.failures, path in unit.broken)
+                if key and not header.broken and not unit.failures["compressed_rollout_without_zstd"]:
+                    if snapshot == stamp(path):
+                        cache.put(key, header)
+            elif check:
+                check()
+            headers[path] = header
+        return headers
+
+    @staticmethod
+    def groups(headers):
         groups = defaultdict(list)
-        self.log_sizes = {}
-        self.broken = set()
-        for path in self.log_files(root):
-            try:
-                self.log_sizes[path] = path.stat().st_size
-            except OSError:
-                self.failures["unreadable_rollout"] += 1
-        for path in self.log_sizes:
-            self.counts["log_files"] += 1
-            for r in self.records(path):
-                if r.get("type") == "session_meta" and isinstance(r["payload"].get("id"), str):
-                    groups[r["payload"]["id"]].append(path)
-                    break
-            else:
-                self.skipped["missing_session_meta"] += 1
-        # Count bytes only in the full pass, not the metadata pass above.
-        self.tick = progress
+        for path, header in headers.items():
+            if header and header.sid is not None:
+                groups[header.sid].append(path)
         for sid, paths in groups.items():
             paths.sort(key=lambda p: (not log_stem(p).endswith(sid), compressed(p)))
-            self.counts["replica_files"] += len(paths) - 1
-            run = None
-            for seq, r in enumerate(self.merged(paths)):
-                try:
-                    p, kind = r["payload"], r["type"]
-                    ts = datetime.fromisoformat(r["timestamp"]).astimezone(UTC).isoformat()
-                    if run is None:
-                        if kind != "session_meta" or p.get("id") != sid:
-                            continue
-                        cwd = absolute(p["cwd"], str(paths[0].parent))
-                        src = p.get("source")
-                        spawn = src.get("subagent", {}) if isinstance(src, dict) else {}
-                        parent = (
-                            spawn.get("thread_spawn", {}).get("parent_thread_id")
-                            if isinstance(spawn, dict)
-                            else None
-                        )
-                        s = Session(
-                            sid,
-                            "codex",
-                            str(paths[0]),
-                            cwd=cwd,
-                            branch=(p.get("git") or {}).get("branch", ""),
-                            started_at=ts,
-                            parent=parent,
-                            resume="codex resume " + shlex.quote(sid),
-                            resume_cwd=cwd,
-                        )
-                        if parent:
-                            child_paths[sid] = spawn["thread_spawn"].get("agent_path")
-                        run = Rollout(s, self)
-                        self.counts["child_sessions"] += int(bool(parent))
-                    elif kind == "session_meta" or ts < run.s.started_at:
-                        self.counts["inherited_records"] += 1
+        return groups
+
+    def cache_entry(self, cache, paths, headers):
+        return cache.entry("codex", paths, stamps=tuple(headers[path].stamp for path in paths))
+
+    def parse_group(self, sid, paths):
+        child_path = None
+        run = None
+        for seq, r in enumerate(self.merged(paths)):
+            try:
+                p, kind = r["payload"], r["type"]
+                ts = datetime.fromisoformat(r["timestamp"]).astimezone(UTC).isoformat()
+                if run is None:
+                    if kind != "session_meta" or p.get("id") != sid:
                         continue
-                    run.seq = seq
-                    run.s.ended_at = ts
-                    run.record(kind, p, ts)
-                except (
-                    TypeError,
-                    ValueError,
-                    KeyError,
-                    AttributeError,
-                    OSError,
-                    RuntimeError,
-                ):
-                    self.failures["malformed_record"] += 1
-            if run and any(path in self.broken for path in paths):
-                self.skipped["partial_rollout"] += 1
-                run = None
-            if run:
-                run.finish()
-                batch[sid] = run.s
-                for field, value, prompt in run.launches:
+                    cwd = absolute(p["cwd"], str(paths[0].parent))
+                    spawn = thread_spawn(p)
+                    parent = spawn.get("parent_thread_id")
+                    s = Session(
+                        sid,
+                        "codex",
+                        str(paths[0]),
+                        cwd=cwd,
+                        branch=(p.get("git") or {}).get("branch", ""),
+                        started_at=ts,
+                        parent=parent,
+                        resume="codex resume " + shlex.quote(sid),
+                        resume_cwd=cwd,
+                    )
+                    if parent:
+                        child_path = spawn.get("agent_path")
+                    run = Rollout(s, self)
+                    self.counts["child_sessions"] += int(bool(parent))
+                elif kind == "session_meta" or ts < run.s.started_at:
+                    self.counts["inherited_records"] += 1
+                    continue
+                run.seq = seq
+                run.s.ended_at = ts
+                run.record(kind, p, ts)
+            except (
+                TypeError,
+                ValueError,
+                KeyError,
+                AttributeError,
+                OSError,
+                RuntimeError,
+            ):
+                self.failures["malformed_record"] += 1
+        if run and any(path in self.broken for path in paths):
+            self.skipped["partial_rollout"] += 1
+            run = None
+        if run:
+            run.finish()
+        return run, child_path
+
+    def sessions(self, root, progress=None, *, headers=None, cache=None, check=None):
+        batch, child_paths, launches = {}, {}, defaultdict(list)
+        if headers is None:
+            headers = self.headers(self.log_files(root), cache, check)
+        self.log_sizes = {}
+        self.broken = set()
+        for path, header in headers.items():
+            if header is None:
+                self.failures["unreadable_rollout"] += 1
+                continue
+            self.log_sizes[path] = header.stamp[1]
+            self.counts["log_files"] += 1
+            self.failures.update(header.failures)
+            if header.broken:
+                self.broken.add(path)
+            if header.sid is None:
+                self.skipped["missing_session_meta"] += 1
+                if progress:
+                    progress(path)
+        for sid, paths in self.groups(headers).items():
+            if check:
+                check()
+            self.counts["replica_files"] += len(paths) - 1
+            key = self.cache_entry(cache, paths, headers) if cache else None
+            cached = cached_parse(cache, key)
+            if cached is None:
+                unit = CodexSource()
+                unit.log_sizes = self.log_sizes
+                unit.broken.update(self.broken.intersection(paths))
+                unit.tick, unit.check = progress, check
+                with observe_paths(key) as observed:
+                    run, child_path = unit.parse_group(sid, paths)
+                cached = (
+                    run.s if run else None, run.launches if run else (), child_path,
+                    unit.counts, unit.skipped, unit.failures, unit.broken,
+                )
+                if key and not unit.broken and not unit.failures["compressed_rollout_without_zstd"]:
+                    if all(stamp(path) == headers[path].stamp for path in paths):
+                        cache.put(key, (cached, observed))
+            session, unit_launches, child_path, counts, skipped, failures, broken = cached
+            self.counts.update(counts)
+            self.skipped.update(skipped)
+            self.failures.update(failures)
+            self.broken.update(broken)
+            if session:
+                batch[sid] = session
+                child_paths[sid] = child_path
+                for field, value, prompt in unit_launches:
                     launches[sid, field, value].append(prompt)
             if progress:
                 for path in paths:

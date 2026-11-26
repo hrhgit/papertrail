@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from ..model import Edit, Hint, Prompt, Read, Replacement, Session
+from .paths import cached_parse, observe_paths, resolved
 from .shell_write import DOC, WORD, literal_path, shell_edits, shell_status
 
 # Report bytes read within a large log this often, so progress keeps moving.
@@ -21,12 +22,35 @@ OTHER_AGENT = re.compile(
     r"(?:^|[\s;&|(`/'\"])(?:codex|claude|kimi|dsh|aider|gemini|cursor-agent|opencode"
     r"|ai_run\.py|codex_app\.py)(?=$|[\s;&|<>)`'\"])"
 )
-GIT_OPTIONS = rf"(?:-[Cc][ \t]*{WORD}|--(?:git-dir|work-tree|namespace)(?:=|[ \t]+){WORD}|--[\w-]+)"
-GIT_CONTENT = re.compile(
-    rf"(?:^|[\s;&|(`/'\"])git['\"]?[ \t]+(?:{GIT_OPTIONS}[ \t]+)*"
+GIT_START = re.compile(r"""(?<![^\s;&|(`/'"])git['"]?[ \t]+""")
+GIT_OPTIONS = (
+    re.compile(rf"(?:-[Cc][ \t]*|--(?:git-dir|work-tree|namespace)(?:=|[ \t]+)){WORD}[ \t]+"),
+    re.compile(r"--[\w-]+[ \t]+"),
+)
+GIT_CONTENT_VERB = re.compile(
     r"(?:checkout|switch|merge|pull|rebase|stash|reset|restore|cherry-pick|revert|am|apply"
     r"|clone|worktree|rm|mv|clean|submodule|checkout-index|read-tree)\b"
 )
+
+
+def git_content(command):
+    # Options such as --work-tree can also match the generic flag syntax.
+    # Explore both readings, but check each resulting offset only once.
+    seen = set()
+    for start in GIT_START.finditer(command):
+        pending = [start.end()]
+        while pending:
+            pos = pending.pop()
+            if pos in seen:
+                continue
+            seen.add(pos)
+            if GIT_CONTENT_VERB.match(command, pos):
+                return True
+            for option in GIT_OPTIONS:
+                if match := option.match(command, pos):
+                    pending.append(match.end())
+    return False
+
 
 # Commands that only read. A diff reported for one of these shows changes made by
 # someone else while it ran, not by the command.
@@ -35,6 +59,10 @@ READ_ONLY = {
     "cmp", "echo", "printf", "true", "pwd", "which", "jq", "cut",
     "column", "od", "hexdump", "shasum", "md5", "du", "sleep",
 }
+READ_ONLY_NAMES = READ_ONLY | {"cd", "git", "sed", "rg", "find", "sort", "tree", "file", "uniq", "xxd"}
+SIMPLE_COMMAND_HEAD = re.compile(
+    r"""[ \t\r\n]*(?:([^ \t\r\n'"\\]+)|'([^']*)'|"([^"\\]*)")(?=[ \t\r\n]|$)"""
+)
 READ_ONLY_GIT = {"diff", "show", "log", "status", "blame", "grep", "ls-files", "rev-parse"}
 HARMLESS_REDIRECT = re.compile(r"(?:1>&2|2>&1|\d?>[ \t]*/dev/null)(?=$|[ \t\n;|])")
 SEGMENTS = re.compile(r"&&|\|\||[;|\n]")
@@ -43,12 +71,23 @@ LEADING_CD = re.compile(rf"\s*cd[ \t]+(?:--[ \t]+)?({WORD})[ \t]*(?:&&|;|\n)")
 SED_PRINT = re.compile(r"[0-9]+(?:,[0-9]+)?p")
 
 
+def shell_name(name):
+    executable = Path(name)
+    return executable.name if executable.parent in (Path("/bin"), Path("/usr/bin")) else name
+
+
 def read_only(command):
     """Whether every part of a command only reads. Unsure forms are not read-only."""
     rest = HARMLESS_REDIRECT.sub(" ", command)
     if any(c in rest.replace("&&", "") for c in "><`$(&"):
         return False
     for segment in SEGMENTS.split(rest):
+        # A literal first word outside the allowlist makes the segment opaque
+        # even if its arguments are large or have unbalanced quotes.
+        if head := SIMPLE_COMMAND_HEAD.match(segment):
+            name = next(value for value in head.groups() if value is not None)
+            if shell_name(name) not in READ_ONLY_NAMES:
+                return False
         try:
             words = shlex.split(segment)
         except ValueError:
@@ -56,9 +95,7 @@ def read_only(command):
         if not words or words[0] == "cd":
             continue
         name, *args = words
-        executable = Path(name)
-        if executable.parent in (Path("/bin"), Path("/usr/bin")):
-            name = executable.name
+        name = shell_name(name)
         if name == "git":
             while args:
                 if args[0] == "-C" and len(args) > 1:
@@ -240,7 +277,7 @@ def read_snapshot(ts, call, result, text):
     path = Path(filename or args["file_path"]).expanduser()
     if not path.is_absolute() and not cwd:
         return None
-    path = str((Path(cwd) / path).resolve())
+    path = resolved((Path(cwd) / path))
     if isinstance(file, dict) and isinstance(file.get("content"), str):
         first, count, total = (file.get(k) for k in ("startLine", "numLines", "totalLines"))
         if (
@@ -302,7 +339,33 @@ class ClaudeCodeSource:
             if path.parent.name == "subagents" or root in (path.parent, path.parent.parent)
         ]
 
-    def sessions(self, root, progress=None):
+    def cache_entry(self, cache, path):
+        return cache.entry("claude-code", [path], sidecars=[path.with_suffix("") / "custom-title.json"])
+
+    def parse_unit(self, path, side, progress, cache):
+        key = self.cache_entry(cache, path) if cache else None
+        cached = cached_parse(cache, key)
+        if cached is None:
+            unit = ClaudeCodeSource()
+            unit.tick = progress
+            with observe_paths(key) as observed:
+                session = unit.parse(path, side)
+            cached = (
+                session, unit.counts, unit.skipped, unit.failures, unit.launches,
+                unit.native_child_calls, unit.foreign_child_calls,
+            )
+            if key and key == self.cache_entry(cache, path):
+                cache.put(key, (cached, observed))
+        session, counts, skipped, failures, launches, native, foreign = cached
+        self.counts.update(counts)
+        self.skipped.update(skipped)
+        self.failures.update(failures)
+        self.launches.update(launches)
+        self.native_child_calls.update(native)
+        self.foreign_child_calls.update(foreign)
+        return session
+
+    def sessions(self, root, progress=None, *, paths=None, cache=None, check=None):
         root = Path(root).expanduser().resolve()
         if not root.is_dir():
             raise ValueError("Log directory missing. Supply an existing --logs directory.")
@@ -310,10 +373,11 @@ class ClaudeCodeSource:
         self.foreign_child_calls.clear()
         batch = []
         inherited = {}
-        self.tick = progress
-        for path in self.log_files(root):
+        for path in self.log_files(root) if paths is None else paths:
+            if check:
+                check()
             side = path.parent.name == "subagents"
-            session = self.parse(path, side)
+            session = self.parse_unit(path, side, progress, cache)
             if progress:
                 progress(path)
             if session.started_at:
@@ -423,7 +487,7 @@ class ClaudeCodeSource:
                 session.ended_at = max(session.ended_at, ts)
                 cwd = record.get("cwd")
                 if isinstance(cwd, str) and cwd and cwd != session.cwd:
-                    session.cwd = str((path.parent / cwd).resolve())
+                    session.cwd = resolved((path.parent / cwd))
                     session.resume_cwd = session.resume_cwd or session.cwd
                 slug = record.get("slug") or slug
                 session.branch = record.get("gitBranch") or session.branch
@@ -540,7 +604,7 @@ class ClaudeCodeSource:
                                 and isinstance(command, str)
                                 and not read_only(command)
                                 and not other_agent(command)
-                                and not GIT_CONTENT.search(command)
+                                and not git_content(command)
                             ):
                                 session.hints.append(
                                     Hint(
@@ -594,7 +658,7 @@ class ClaudeCodeSource:
         if not isinstance(diff, dict) or not isinstance(diff.get("files"), list):
             return []
         command = args.get("command") if isinstance(args.get("command"), str) else ""
-        if other_agent(command) or GIT_CONTENT.search(command):
+        if other_agent(command) or git_content(command):
             self.skipped["bash_diff_other_writer"] += len(diff["files"])
             return []
         if read_only(command):
@@ -639,7 +703,7 @@ class ClaudeCodeSource:
                     seq,
                     ts,
                     "Bash",
-                    str(path.resolve()),
+                    resolved(path),
                     prompt,
                     model or session.model,
                     patch=patch,
@@ -681,7 +745,7 @@ class ClaudeCodeSource:
             seq,
             ts,
             name,
-            str(path.resolve()),
+            resolved(path),
             prompt,
             model or session.model,
             effort=effort,

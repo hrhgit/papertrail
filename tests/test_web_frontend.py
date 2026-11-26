@@ -300,3 +300,152 @@ const assert = (condition, message) => { if (!condition) throw Error(message); }
   console.log(JSON.stringify(true));
 })();
 """)
+
+
+def test_background_status_preserves_the_reader_and_its_hover_tip():
+    assert run_page("""
+const label = { textContent: "" };
+const meter = { firstChild: { style: {} }, setAttribute() {} };
+const progress = { hidden: true, querySelector: (selector) => selector === ".meter" ? meter : label };
+const retry = { hidden: true };
+const tip = { hidden: false, textContent: "Current line" };
+document.getElementById = (id) => ({
+  "history-progress": progress, "history-incomplete": retry, "status-tip": tip,
+})[id];
+state.workspace = { project: "/demo", ready: true, complete: false };
+const full = { running: true, phase: "full", stage: "read", elapsed: 30, fraction: 0.44, sources: [
+  { name: "codex", files: 5, read_files: 2, bytes: 1000000, read_bytes: 440000 },
+] };
+state.building = true;
+updateBuild(full);
+const running = [progress.hidden, retry.hidden, tip.textContent, label.textContent, progress.title, quickBuildRunning()];
+state.building = false;
+updateBuild({ phase: "cancelled", running: false });
+const stopped = [progress.hidden, retry.hidden, tip.textContent];
+state.workspace.complete = true;
+renderHistoryStatus();
+console.log(JSON.stringify([running, stopped, retry.hidden]));
+""") == [
+        [False, True, "Current line", "Reading older logs… 42% · ~40 s left",
+         "Codex — 2 of 5 files · 440 KB of 1 MB", False],
+        [True, False, "Current line"],
+        True,
+    ]
+
+
+def test_build_poll_switches_to_reader_and_refreshes_it_on_completion():
+    assert run_page("""
+const stages = [];
+const phase = (phase, ready, complete) => ({project:"/demo", phase, ready, complete, running:phase !== "done"});
+state.workspace = {project:"/demo", ready:false, complete:false};
+globalThis.setTimeout = (callback) => { callback(); };
+showUnbuilt = async () => { stages.push("build screen"); };
+loadOverview = async ({preserve}) => {
+  stages.push(["overview", state.workspace.complete, preserve]);
+  state.overview = { complete: state.workspace.complete };
+};
+const next = [phase("full", true, false), phase("done", true, true)];
+api = async () => next.shift();
+updateBuild = (status) => stages.push([status.phase, quickBuildRunning()]);
+renderHistoryStatus = () => {};
+rememberFolder = () => {};
+toast = (message) => stages.push(message);
+followBuild(phase("quick", false, false)).then(() => console.log(JSON.stringify(stages)));
+""") == [
+        "build screen", ["quick", True], ["overview", False, True], ["full", False],
+        "History complete", ["overview", True, True],
+    ]
+
+
+BUILD_REFRESH_PAGE = """
+const panelBox = {scrollTop: 40};
+const chatBox = {scrollTop: 150};
+document.getElementById = (id) => ({"panel":panelBox, "chat-body":chatBox})[id];
+state.workspace = {project:"/demo", ready:true, complete:false};
+state.overview = {complete:false};
+const overview = {project:"/demo", complete:true, home:"/", sessions:[], files:[], crossings:[]};
+const file = (path, status="current") => ({path, status, tracks:[], lines:["one", "two"], gaps:[]});
+state.file = file("/demo/a.py", "untracked");
+for (const init of [
+  () => renderHistoryStatus = () => {},
+  () => record = () => {},
+  () => buildEntries = () => [],
+  () => renderSummary = () => {},
+  () => renderFiles = () => {},
+  () => renderCrossings = () => {},
+  () => renderSessions = () => {},
+  () => addTab = () => {},
+  () => ensureExpanded = () => {},
+  () => renderFile = () => {},
+  () => renderTabs = () => {},
+  () => markFileRow = () => {},
+  () => markSelected = () => {},
+  () => writeHash = () => {},
+]) init();
+"""
+
+
+@pytest.mark.parametrize("selection", ["line", "deletion", "outline"])
+def test_build_refresh_reloads_selected_history_panel(selection):
+    assert run_page(BUILD_REFRESH_PAGE + """
+const calls = [];
+const reload = file("/demo/a.py");
+const deletion = {after: 0, session:"new"};
+state.line = 2;
+switch (input) {
+  case "line":
+    state.panel = {view:"trace", path:reload.path, line:2, text:"two"};
+    break;
+  case "deletion":
+    state.line = null;
+    state.gap = 0;
+    reload.gaps = [deletion];
+    state.panel = {view:"trace", path:reload.path, gap:0};
+    break;
+  case "outline":
+    state.panel = {view:"span", path:reload.path, span:{line:2, end:2, name:"example"}};
+}
+api = async (name, params) => {
+  calls.push(name);
+  if (name === "overview") return overview;
+  if (name === "tree") return {};
+  if (name === "file") return reload;
+  if (name === "trace") return {rows:[{chain:["edit"], kind:"agent", session:"new"}]};
+  if (name === "span") return {rows:[{kind:"agent", session:"new"}], end:2};
+};
+h = () => ({});
+setPanel = () => { panelBox.scrollTop = chatBox.scrollTop = 0; };
+renderTraceView = async () => {
+  await Promise.resolve();
+  chatBox.scrollTop = 0;
+};
+loadOverview({preserve:true}).then(() => {
+  const loaded = state.trace?.stops[0]?.session === "new";
+  console.log(JSON.stringify([loaded, calls.filter(n => ["trace","span"].includes(n)), panelBox.scrollTop, chatBox.scrollTop]));
+});
+""", selection) == [True, {"line": ["trace"], "deletion": [], "outline": ["span"]}[selection], 40, 150]
+
+
+def test_build_refresh_does_not_swallow_a_delayed_file_click():
+    assert run_page(BUILD_REFRESH_PAGE + """
+const requests = [];
+let release;
+const delayed = new Promise(resolve => { release = resolve; });
+api = async (name, params) => {
+  if (name === "overview") return overview;
+  if (name === "tree") return {};
+  const path = params.path;
+  requests.push(path);
+  return requests.length === 1 ? delayed : file(path);
+};
+showPanel = () => {};
+(async () => {
+  const click = openFile("/demo/b.py");
+  const refresh = loadOverview({preserve:true});
+  // Let the overview finish while the file request is still in flight.
+  for (let i = 0; i < 8; i++) await Promise.resolve();
+  release(file("/demo/b.py", "untracked"));
+  await Promise.all([click, refresh]);
+  console.log(JSON.stringify([state.file.path, state.file.status, requests]));
+})();
+""") == ["/demo/b.py", "current", ["/demo/b.py", "/demo/b.py"]]

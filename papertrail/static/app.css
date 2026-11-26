@@ -895,6 +895,9 @@ button.link { border: 0; background: none; padding: 0; text-decoration: underlin
 .status .stale-tag { padding: 0 8px; font-size: 12px; }
 .status-btn { flex: none; padding: 1px 8px; border: 0; background: none; color: var(--muted); font-size: 12.5px; border-radius: 4px; }
 .status-btn:hover, .status-btn[aria-pressed="true"] { background: var(--hover); color: var(--ink); }
+.history-status { display: flex; align-items: center; gap: 6px; flex: 0 1 auto; min-width: 0; max-width: 50%; color: var(--muted); white-space: nowrap; }
+.history-status .meter { flex: 0 1 32px; min-width: 8px; }
+.history-status-text, #history-incomplete { display: block; overflow: hidden; text-overflow: ellipsis; }
 .status-line[hidden] { display: none; }
 .status-tip { display: block; overflow: hidden; text-overflow: ellipsis; }
 

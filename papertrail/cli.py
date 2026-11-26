@@ -11,9 +11,9 @@ from time import perf_counter
 
 import relate
 
-from .graph import build, select
+from .ingest import ingest
 from .queries import Queries
-from .sources import DEFAULT_LOGS, SOURCES, ReadProgress, load_sources
+from .sources import DEFAULT_LOGS, SOURCES, ReadProgress
 
 
 class TerminalProgress(ReadProgress):
@@ -35,10 +35,15 @@ class TerminalProgress(ReadProgress):
             )
             self.stream.flush()
 
+    def stage(self, step, files=None):
+        if step == "select":
+            self.clear()
+
     def clear(self):
         if self.shown:
             self.stream.write("\r\033[K")
             self.stream.flush()
+            self.shown = 0.0
 
 
 def positive(value):
@@ -154,6 +159,8 @@ def parser():
             group.add_argument(
                 "--all", action="store_true", help="Keep every session in the logs."
             )
+            p.add_argument("--no-cache", action="store_true", help="Parse logs without the local cache.")
+            p.add_argument("--quick-only", action="store_true", help="Publish the first pass and stop.")
             p.add_argument(
                 "--portable",
                 type=Path,
@@ -202,6 +209,10 @@ def parser():
     ui.add_argument("--project", type=Path, help="Folder to open (defaults to this directory).")
     ui.add_argument("--port", type=int, default=8765)
     ui.add_argument("--no-browser", action="store_true")
+    ui.add_argument("--build", action="store_true", help="Build the open folder's history on startup.")
+    ui.add_argument("--claude-logs", type=Path)
+    ui.add_argument("--codex-logs", type=Path)
+    ui.add_argument("--portable", type=Path)
     return app
 
 
@@ -330,7 +341,8 @@ def main(argv=None):
     try:
         args = parser().parse_args(argv)
         command = args.command
-        project = (getattr(args, "project", None) or Path.cwd()).resolve()
+        requested = (getattr(args, "project", None) or Path.cwd()).expanduser()
+        project = requested.resolve()
         store = (args.store or project / ".papertrail/graph.rl").expanduser()
         if command == "skill":
             text = skill_text(args.store and store.resolve())
@@ -357,11 +369,16 @@ def main(argv=None):
         if command == "ui":
             from .web import serve
 
-            if args.store and not store.is_file():
+            if args.store and not args.build and not store.is_file():
                 raise ValueError("Store missing. Run papertrail ingest or supply its --store path.")
             # Without a graph the page opens on this folder and offers to build one.
-            folder = project if (args.project or not args.store) else None
-            serve(store, port=args.port, open_browser=not args.no_browser, project=folder)
+            folder = requested if (args.project or not args.store or args.build) else None
+            overrides = {"claude-code": args.claude_logs, "codex": args.codex_logs}
+            roots = {
+                name: overrides[name] or Path.home() / DEFAULT_LOGS[name] for name in SOURCES
+            } if any(overrides.values()) else None
+            serve(store, port=args.port, open_browser=not args.no_browser, project=folder,
+                  build_on_start=args.build, roots=roots, portable=args.portable)
             return 0
         if command == "ingest":
             if not args.all and not project.is_dir():
@@ -381,15 +398,21 @@ def main(argv=None):
                 if not chosen or name == chosen
             }
             progress = TerminalProgress(sys.stderr) if sys.stderr.isatty() else None
+            pass_seconds = {}
             try:
-                parsed, diagnostics = load_sources(roots, progress)
+                for phase, seconds, diagnostics in ingest(
+                    store, roots, None if args.all else requested, portable=args.portable,
+                    cache=not args.no_cache, quick_only=args.quick_only, progress=progress,
+                ):
+                    pass_seconds[phase] = seconds
+                    if phase == "quick" and not args.quick_only:
+                        print("Partial history is ready. Reading the remaining logs…", file=sys.stderr)
             finally:
                 if progress:
                     progress.clear()
-            sessions = select(parsed, None if args.all else project)
-            build(store, sessions, portable=args.portable)
             with Queries(store) as q:
                 result = q.stats()
+            result.update(passes=list(pass_seconds), pass_seconds=pass_seconds)
             result["rows"][0].update(
                 seconds=round(perf_counter() - start, 3),
                 sources=diagnostics,
@@ -426,6 +449,10 @@ def main(argv=None):
                     result = q.crossings(args.file, args.limit)
                 else:
                     result = q.stats(args.limit)
+                if not q.complete:
+                    result["complete"] = False
+                    print("History is still incomplete; run papertrail ingest again to finish.",
+                          file=sys.stderr)
         statements = result.pop("cypher")
         if getattr(args, "show_cypher", False):
             if args.json:
@@ -438,6 +465,8 @@ def main(argv=None):
         else:
             display(command, result)
         return 0
+    except KeyboardInterrupt:
+        return 130
     except (ValueError, OSError, relate.Error, NotImplementedError) as exc:
         message = str(exc)
         if isinstance(exc, relate.Error):

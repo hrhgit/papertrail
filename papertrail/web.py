@@ -25,6 +25,7 @@ import webbrowser
 from bisect import bisect_right
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.resources import files as package_files
@@ -33,10 +34,11 @@ from urllib.parse import parse_qs, urlparse
 
 import relate
 
-from .graph import build, portable_root, select
+from .graph import portable_root
+from .ingest import ingest
 from .logfile import open_log
 from .queries import FIELDS, INFERENCE_OWNER, OWNER, Queries, file_version
-from .sources import DEFAULT_LOGS, SOURCES, ReadProgress, load_sources
+from .sources import DEFAULT_LOGS, SOURCES, ReadProgress
 from .transcript import conversation, conversation_version, written_diff
 
 STATIC = package_files("papertrail") / "static"
@@ -493,6 +495,9 @@ class ReaderQueries(Queries):
             for parent, links in parents.get(row["id"], ((None, 1),))
         ]
 
+    def completeness(self):
+        return self.complete
+
     def overview(self):
         if hasattr(self, "_overview"):
             self.statements[:] = self._overview["cypher"]
@@ -527,6 +532,7 @@ class ReaderQueries(Queries):
         crossings = self._crossings(None, limit=200)
         self._overview = {
             "stats": stats,
+            "complete": self.complete,
             "files": files,
             "sessions": sessions,
             "crossings": crossings["rows"],
@@ -698,17 +704,48 @@ class BuildJob(ReadProgress):
     find, read, select, replay, write, then done or failed.
     """
 
-    def __init__(self, project, store, roots):
+    def __init__(self, project, store, roots, *, portable=None, complete=False):
         super().__init__()
-        self.project, self.store, self.roots = project, store, roots
+        self.requested = Path(project)
+        self.project, self.store, self.roots = self.requested.resolve(), store, roots
+        self.portable = portable
+        self.complete = complete
+        self.phase = "full" if complete else "quick"
         self.lock = threading.Lock()
         self.ended = threading.Event()
         self.cancelled = False
-        self.started = time.monotonic()
+        self.started = self.pass_started = time.monotonic()
         self.finished = None
         self.step = "find"
         self.read_sessions = self.kept = self.files = None
         self.error = None
+
+    def check(self):
+        if self.cancelled:
+            raise BuildCancelled
+
+    def cancel(self):
+        with self.lock:
+            self.cancelled = True
+
+    def begin(self, phase):
+        with self.lock:
+            self.check()
+            super().begin(phase)
+            self.phase, self.step = phase, "find"
+            self.pass_started = time.monotonic()
+            self.read_sessions = self.kept = self.files = None
+
+    def selected(self, read, kept):
+        with self.lock:
+            self.read_sessions, self.kept = read, kept
+
+    @contextmanager
+    def publish(self, complete):
+        with self.lock:
+            self.check()
+            yield
+            self.complete = complete
 
     def found(self, name, root, paths):
         with self.lock:
@@ -717,8 +754,7 @@ class BuildJob(ReadProgress):
                 self.step = "read"
 
     def read(self, name, path, nbytes=None):
-        if self.cancelled:
-            raise BuildCancelled
+        self.check()
         with self.lock:
             self.step = "read"
             super().read(name, path, nbytes)
@@ -728,8 +764,7 @@ class BuildJob(ReadProgress):
             super().done(name, sessions)
 
     def stage(self, step, files=None):
-        if self.cancelled:
-            raise BuildCancelled
+        self.check()
         with self.lock:
             self.step = step
             self.files = files if files is not None else self.files
@@ -740,20 +775,26 @@ class BuildJob(ReadProgress):
 
     def run(self):
         try:
-            parsed, _ = load_sources(self.roots, progress=self)
-            self.stage("select")
-            sessions = select(parsed, self.project)
-            with self.lock:
-                self.read_sessions = len(parsed)
-                self.kept = sum(1 for s in sessions if s.edits)
-            build(self.store, sessions, stage=self.stage)
+            for _ in ingest(
+                self.store, self.roots, self.requested, progress=self, check=self.check,
+                portable=self.portable, publish=self.publish,
+            ):
+                pass
         except Exception as exc:
             if not isinstance(exc, (ValueError, OSError, relate.Error, BuildCancelled)):
-                traceback.print_exc()
+                # Parse exceptions can contain private log content, so print where it
+                # failed (Paper Trail's own code) without the exception message.
+                frames = "".join(traceback.format_list(traceback.extract_tb(exc.__traceback__)))
+                print(f"Paper Trail build failed ({type(exc).__name__}).\n{frames}", file=sys.stderr, end="")
             self.error = exc
         finally:
-            self.finished = time.monotonic()
-            self.ended.set()
+            with self.lock:
+                self.phase = (
+                    "cancelled" if isinstance(self.error, BuildCancelled)
+                    else "failed" if self.error else "done"
+                )
+                self.finished = time.monotonic()
+                self.ended.set()
 
     def status(self):
         with self.lock:
@@ -761,8 +802,11 @@ class BuildJob(ReadProgress):
                 "running": self.running,
                 "project": str(self.project),
                 "store": str(self.store),
-                "elapsed": round((self.finished or time.monotonic()) - self.started, 1),
-                "stage": ("failed" if self.error else "done") if self.finished else self.step,
+                "elapsed": round((self.finished or time.monotonic()) - self.pass_started, 1),
+                "phase": self.phase,
+                "stage": self.phase if self.finished else self.step,
+                "complete": self.complete,
+                "ready": self.store.is_file(),
                 "sources": [dict(s) for s in self.sources.values()],
                 "fraction": round(self.fraction(), 4) if self.sources else 0.0,
                 "sessions_read": self.read_sessions,
@@ -776,8 +820,8 @@ class Reader:
     """Holds the open folder and one read-only connection to its graph.
 
     The connection reopens when the store file changes on disk, so a rebuild from
-    the CLI shows up on the next request. While a build runs in the background,
-    graph queries wait for it and files open as plain text.
+    the CLI shows up on the next request. Before the first publication, files
+    can still open as plain text.
     """
 
     def __init__(self, store=None, project=None):
@@ -785,6 +829,8 @@ class Reader:
         self.project = Path(project).expanduser().resolve() if project else None
         self.lock = threading.RLock()
         self.db_worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="papertrail-db")
+        self.build_worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="papertrail-build")
+        self.build_options = {}
         self.closed = False
         self.queries = None
         self.graph_version = None
@@ -799,7 +845,7 @@ class Reader:
 
     @property
     def building(self):
-        return bool(self.job and self.job.running)
+        return bool(self.job and self.job.running and not self.job.cancelled and self.job.project == self.project)
 
     def call(self, method, *args, **kwargs):
         return self._submit_query(method, args, kwargs).result()[0]
@@ -807,9 +853,9 @@ class Reader:
     def _require_history(self):
         if self.closed:
             raise ValueError("The reader is shutting down.")
-        if self.building:
-            raise ValueError("History is still building. Try again when it finishes.")
-        if self.store is None or not self.store.is_file():
+        if not self._ready():
+            if self.building:
+                raise ValueError("History is still building. Try again when it publishes.")
             raise ValueError("No history for this folder yet. Build it first.")
 
     def _submit_query(self, method, args=(), kwargs=None, *, store=None, version=None, check=None):
@@ -907,52 +953,61 @@ class Reader:
         return search_result(query, case, word, hits, truncated, *history, check)
 
     def _ready(self):
-        return bool(self.store and self.store.is_file()) and not (self.building or self.closed)
+        return bool(self.store and self.store.is_file()) and not self.closed
 
     def workspace(self):
         with self.lock:
+            ready = self._ready()
             return {
                 "project": str(self.project) if self.project else None,
                 "store": str(self.store) if self.store else None,
-                "ready": self._ready(),
+                "ready": ready,
+                "complete": self.call("completeness") if ready else False,
                 "building": self.building,
                 "home": str(Path.home()),
             }
 
     def open(self, folder):
-        folder = Path(folder).expanduser().resolve()
-        if not folder.is_dir():
-            raise ValueError("Folder missing. Pick an existing folder.")
+        requested = Path(folder).expanduser()
         with self.lock:
-            if self.closed:
-                raise ValueError("The reader is shutting down.")
-            if self.building:
-                raise ValueError("Wait for the history build to finish, then open another folder.")
-            if folder != self.project:
-                self.db_worker.submit(self._close)
-            self.project, self.store = folder, self.known.get(folder) or store_for(folder)
+            self._open_folder(requested.resolve())
             return self.workspace()
 
+    def _open_folder(self, folder, rebuild=False):
+        if not folder.is_dir():
+            raise ValueError("Folder missing. Pick an existing folder.")
+        if self.closed:
+            raise ValueError("The reader is shutting down.")
+        if self.building and not rebuild and folder == Path(self.job.project).resolve():
+            # Reopening the folder being built keeps its background pass running.
+            return
+        if self.building:
+            if self.job.status()["phase"] == "quick":
+                raise ValueError("Wait for the first pass to finish, then open another folder.")
+            self.job.cancel()
+        if folder != self.project:
+            self.db_worker.submit(self._close)
+        self.project, self.store = folder, self.known.get(folder) or store_for(folder)
+
     def build(self, folder, roots=None):
-        """Same as `papertrail ingest --project FOLDER` with the default log roots,
-        run to the end on this thread."""
+        """Build a folder and wait for publication."""
         with self.lock:
             job = self._new_job(folder, roots)
-        job.run()
+            task = self.build_worker.submit(job.run)
+        task.result()
         if job.error:
             raise job.error
         return self.build_status()["result"]
 
-    def start_build(self, folder, roots=None):
-        """Start the same build on a worker thread. Poll `build_status` for progress.
-        Asking again for the folder already building returns its progress."""
+    def start_build(self, folder, roots=None, *, portable=None):
+        """Start building on a worker. Poll `build_status` for progress."""
         with self.lock:
-            if self.building:
+            if self.building and self.job.status()["phase"] == "quick":
                 if Path(folder).expanduser().resolve() == self.job.project:
                     return self.build_status()
-                raise ValueError("Another folder's history is building. Wait for it to finish.")
-            job = self._new_job(folder, roots)
-            threading.Thread(target=job.run, name="papertrail-build", daemon=True).start()
+                raise ValueError("Another folder's first pass is building. Wait for it to finish.")
+            job = self._new_job(folder, roots, portable)
+            self.build_worker.submit(job.run)
             return self.build_status()
 
     def build_status(self):
@@ -960,24 +1015,29 @@ class Reader:
             if self.job is None:
                 return {"running": False, "stage": None}
             status = self.job.status()
-            if status["stage"] == "done":
+            if status["phase"] == "done" and self.job.project == self.project:
                 status["result"] = {
                     **self.workspace(),
                     "sessions": self.job.kept,
                     "sessions_read": self.job.read_sessions,
-                    "seconds": status["elapsed"],
+                    "seconds": round(self.job.finished - self.job.started, 1),
                 }
             return status
 
-    def _new_job(self, folder, roots):
-        self.open(folder)
-        roots = roots or {name: Path.home() / DEFAULT_LOGS[name] for name in SOURCES}
-        # A portable folder carries its own logs, as the bundled demo does.
-        shipped = self.db_worker.submit(portable_root, self.store).result() if self.store else None
-        if shipped and (shipped / "logs").is_dir():
-            roots = {"claude-code": shipped / "logs/claude", "codex": shipped / "logs/codex"}
-        self.db_worker.submit(self._close)
-        self.job = BuildJob(self.project, self.store, roots)
+    def _new_job(self, folder, roots, portable=None):
+        requested = Path(folder).expanduser()
+        self._open_folder(requested.resolve(), rebuild=True)
+        if roots is not None or portable is not None:
+            self.build_options[self.project] = (roots, portable)
+        roots, portable = self.build_options.get(self.project, (None, None))
+        if roots is None:
+            roots = {name: Path.home() / DEFAULT_LOGS[name] for name in SOURCES}
+            # A portable folder carries its own logs, as the bundled demo does.
+            shipped = self.db_worker.submit(portable_root, self.store).result()
+            if shipped and (shipped / "logs").is_dir():
+                roots = {"claude-code": shipped / "logs/claude", "codex": shipped / "logs/codex"}
+        complete = self._ready() and self.call("completeness")
+        self.job = BuildJob(requested, self.store, roots, portable=portable, complete=complete)
         return self.job
 
     def tree(self):
@@ -1013,13 +1073,12 @@ class Reader:
             if self.closed:
                 return
             self.closed = True
-            job = self.job if self.building else None
+            if self.job and self.job.running:
+                self.job.cancel()
             task = self.db_worker.submit(self._close)
-        # Stop a build between two log files, so its private staging folder is removed.
-        if job:
-            job.cancelled = True
-            job.ended.wait(15)
+        # Wait for cancelled builds to remove their private staging folders.
         try:
+            self.build_worker.shutdown()
             task.result()
         finally:
             self.db_worker.shutdown()
@@ -1407,12 +1466,15 @@ def file_window(params):
     return start, end
 
 
-def serve(store=None, host="127.0.0.1", port=8765, open_browser=True, project=None):
+def serve(store=None, host="127.0.0.1", port=8765, open_browser=True, project=None, *,
+          build_on_start=False, roots=None, portable=None):
     reader = Reader(store, project)
     try:
-        if reader.workspace()["ready"]:
+        if reader._ready():
             reader.call("validate")
         with ThreadingHTTPServer((host, port), handler(reader)) as server:
+            if build_on_start:
+                reader.start_build(project, roots=roots, portable=portable)
             url = f"http://{host}:{server.server_address[1]}/"
             where = f"store: {reader.store}" if reader.workspace()["ready"] else "no history yet, open or build one in the page"
             print(f"Paper Trail reader on {url}  ({where})  Ctrl+C to stop.", flush=True)

@@ -127,6 +127,31 @@ class _PackageStream(io.RawIOBase):
         super().close()
 
 
+class _Buffered(io.BufferedReader):
+    """A buffered reader that can carry the compressed file it decodes."""
+
+    source = None
+
+
+def _stdlib_stream(zstd, path):
+    raw = path.open("rb")
+
+    class Owned(zstd.ZstdFile):
+        source = raw
+
+        def close(self):
+            try:
+                super().close()
+            finally:
+                raw.close()
+
+    try:
+        return Owned(raw, "rb")
+    except BaseException:
+        raw.close()
+        raise
+
+
 def open_log(path):
     """A binary stream of the log's JSONL text. Raises OSError when it can't be read,
     and ZstdUnavailable when the file is compressed and no decoder exists."""
@@ -134,9 +159,22 @@ def open_log(path):
     if not compressed(path):
         return path.open("rb")
     if zstd := _stdlib():
-        return zstd.open(path, "rb")
+        return _stdlib_stream(zstd, path)
     if zstandard := _package():
-        return io.BufferedReader(_PackageStream(path, zstandard))
+        inner = _PackageStream(path, zstandard)
+        stream = _Buffered(inner)
+        stream.source = inner.raw
+        return stream
     if shutil.which("zstd"):
         return io.BufferedReader(_Command(path))
     raise ZstdUnavailable(f"no zstd decoder for {path.name}")
+
+
+def compressed_read(stream):
+    """How many bytes of the compressed file a stream from `open_log` has consumed,
+    or None when the decoder doesn't say (the `zstd` command)."""
+    source = getattr(stream, "source", None)
+    try:
+        return source.tell() if source is not None and not source.closed else None
+    except (OSError, ValueError):
+        return None
