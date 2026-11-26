@@ -253,3 +253,39 @@ def test_shared_payload_cannot_confirm_literal_shell_write(tmp_path, exit_code):
     (parsed,) = source.sessions(logs)
     assert not [e for e in parsed.edits if e.tool == "Bash"]
     assert source.failures["ambiguous_shared_result"] == 1
+
+
+def test_short_name_after_earlier_cd_is_named(tmp_path):
+    # Claude's shell keeps an earlier cd, so the recorded cwd may be a parent.
+    entry = {"filePath": str(tmp_path / "pkg" / "web.py"), "hunks": [hunk(1, ["old"], ["new"])]}
+    for command in ("python3 rewrite.py web.py", "cd /elsewhere; python3 fix.py pkg/web.py"):
+        s, _ = session(tmp_path, command, [entry])
+        assert [e.path for e in s.edits if e.tool == "Bash"] == [entry["filePath"]]
+
+
+def test_short_name_shared_by_two_changed_files_is_ambiguous(tmp_path):
+    a = {"filePath": str(tmp_path / "a" / "web.py"), "hunks": [hunk(1, ["old"], ["new"])]}
+    b = {"filePath": str(tmp_path / "b" / "web.py"), "hunks": [hunk(1, ["old"], ["new"])]}
+    s, source = session(tmp_path, "python3 rewrite.py web.py", [a, b])
+    assert not [e for e in s.edits if e.tool == "Bash"]
+    assert source.skipped["bash_diff_unnamed_file"] == 2
+
+
+def test_agent_name_in_script_text_is_not_another_writer(tmp_path):
+    body = "from pathlib import Path\nAGENTS = ['codex', 'claude']\nPath('notes.txt').write_text('new')\n"
+    s, _ = session(tmp_path, f"python3 - <<'PY'\n{body}PY", [notes(tmp_path)])
+    assert [e.tool for e in s.edits if e.tool == "Bash"] == ["Bash"]
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "python3 - <<'PY'\nimport subprocess\nsubprocess.run(['codex', 'exec', 'notes.txt'])\nPY",
+        "bash <<'SH'\ncodex exec 'fix notes.txt'\nSH",
+        "cat <<'SH' > run.sh && bash run.sh\nclaude -p 'fix notes.txt'\nSH",
+    ],
+)
+def test_script_that_launches_an_agent_is_another_writer(tmp_path, command):
+    s, source = session(tmp_path, command, [notes(tmp_path)])
+    assert not [e for e in s.edits if e.tool == "Bash"]
+    assert source.skipped["bash_diff_other_writer"] == 1

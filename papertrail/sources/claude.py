@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from ..model import Edit, Prompt, Read, Replacement, Session
-from .shell_write import WORD, literal_path, shell_edits, shell_status
+from .shell_write import DOC, WORD, literal_path, shell_edits, shell_status
 
 # Report bytes read within a large log this often, so progress keeps moving.
 READ_CHUNK = 1 << 22
@@ -38,9 +38,9 @@ READ_ONLY = {
 READ_ONLY_GIT = {"diff", "show", "log", "status", "blame", "grep", "ls-files", "rev-parse"}
 HARMLESS_REDIRECT = re.compile(r"(?:1>&2|2>&1|\d?>[ \t]*/dev/null)(?=$|[ \t\n;|])")
 SEGMENTS = re.compile(r"&&|\|\||[;|\n]")
-SED_PRINT = re.compile(r"[0-9]+(?:,[0-9]+)?p")
 CHANGES_DIRECTORY = re.compile(r"(?:^|[\n;&|'\"])\s*(?:cd|pushd|popd)(?=\s|$)")
 LEADING_CD = re.compile(rf"\s*cd[ \t]+(?:--[ \t]+)?({WORD})[ \t]*(?:&&|;|\n)")
+SED_PRINT = re.compile(r"[0-9]+(?:,[0-9]+)?p")
 
 
 def read_only(command):
@@ -97,16 +97,29 @@ def read_only(command):
     return True
 
 
-def names(command, path, cwd):
-    """Match a complete path, including its directory if the command uses one."""
+def spelled(command, form):
+    return re.search(rf"(?<![\w./~-]){re.escape(form)}(?![\w./~-])", command) is not None
+
+
+def names_exactly(command, path, cwd):
+    """The full path, or the path relative to where a simple leading cd went."""
     spellings = [str(path)]
     if cwd:
         relative = os.path.relpath(path, cwd)
         spellings.extend((relative, "./" + relative))
-    for spelling in spellings:
-        if re.search(rf"(?<![\w./~-]){re.escape(spelling)}(?![\w./~-])", command):
-            return True
-    return False
+    return any(spelled(command, s) for s in spellings)
+
+
+def tail_name(command, path):
+    """The shortest trailing part of the path the command names (`web.py`,
+    `pkg/web.py`), or None. A same-named file elsewhere (`other/web.py`) or a
+    longer name (`data.py`) does not match."""
+    parts = Path(path).parts
+    for i in range(len(parts) - 1, 0, -1):
+        tail = str(Path(*parts[i:]))
+        if spelled(command, tail) or spelled(command, "./" + tail):
+            return tail
+    return None
 
 
 def command_cwd(command, cwd):
@@ -115,6 +128,41 @@ def command_cwd(command, cwd):
     if (cd := LEADING_CD.match(command)) and not CHANGES_DIRECTORY.search(command[cd.end() :]):
         return literal_path(cd[1], cwd)
     return None if CHANGES_DIRECTORY.search(command) else cwd
+
+
+# Code that starts another process. A script body mentioning an agent name is only
+# another writer when it can run something.
+LAUNCHES = re.compile(
+    r"\b(?:subprocess|os\.system|os\.exec|os\.spawn|popen|execSync|spawnSync|child_process"
+    r"|system\s*\(|exec\s*\(|`)"
+)
+
+
+# A heredoc fed straight to one of these is a script, not shell. Any other heredoc
+# (`bash <<EOF`, `cat <<EOF > run.sh`) may run as shell.
+SCRIPT_INPUT = re.compile(r"(?:^|[\s;&|(/])(?:python[\d.]*|node|ruby|perl)(?:[ \t]+-[\w-]*)*[ \t]*$")
+
+
+def other_agent(command):
+    """Whether the command runs another agent. A script body fed to an interpreter is
+    code, so a name there (a string such as "codex") counts only next to a process
+    launch."""
+    shell, bodies, rows = [], [], iter(command.split("\n"))
+    for line in rows:
+        shell.append(line)
+        for doc in DOC.finditer(line):
+            body = []
+            for row in rows:
+                if (row.lstrip("\t") if doc["tabs"] else row) == doc["tag"]:
+                    break
+                body.append(row)
+            if SCRIPT_INPUT.search(line[: doc.start()]):
+                bodies.append("\n".join(body))
+            else:
+                shell.extend(body)
+    if OTHER_AGENT.search("\n".join(shell)):
+        return True
+    return any(OTHER_AGENT.search(b) and LAUNCHES.search(b) for b in bodies)
 
 
 def hunk_counts_match(hunk):
@@ -527,13 +575,20 @@ class ClaudeCodeSource:
         if not isinstance(diff, dict) or not isinstance(diff.get("files"), list):
             return []
         command = args.get("command") if isinstance(args.get("command"), str) else ""
-        if OTHER_AGENT.search(command) or GIT_CONTENT.search(command):
+        if other_agent(command) or GIT_CONTENT.search(command):
             self.skipped["bash_diff_other_writer"] += len(diff["files"])
             return []
         if read_only(command):
             self.skipped["bash_diff_read_only"] += len(diff["files"])
             return []
         named_from = command_cwd(command, cwd)
+        # A short name such as `web.py` identifies a file only when no other file
+        # in this diff answers to it.
+        tails = Counter(
+            tail_name(command, Path(cwd or "/", e["filePath"]).expanduser())
+            for e in diff["files"]
+            if isinstance(e, dict) and isinstance(e.get("filePath"), str) and e["filePath"]
+        )
         edits = []
         for i, entry in enumerate(diff["files"]):
             filename = entry.get("filePath") if isinstance(entry, dict) else None
@@ -547,7 +602,8 @@ class ClaudeCodeSource:
                     self.failures["relative_path_without_cwd"] += 1
                     continue
                 path = Path(cwd) / path
-            if not names(command, path, named_from):
+            tail = tail_name(command, path)
+            if not names_exactly(command, path, named_from) and (tail is None or tails[tail] > 1):
                 self.skipped["bash_diff_unnamed_file"] += 1
                 continue
             if not hunks or not all(isinstance(h, dict) and hunk_counts_match(h) for h in hunks):
