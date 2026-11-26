@@ -54,6 +54,19 @@ class Edit:
 
 
 @dataclass
+class Hint:
+    id: str
+    seq: int
+    ts: str
+    tool: str
+    cwd: str
+    command: str = field(repr=False)
+    prompt: str | None
+    model: str
+    effort: str
+
+
+@dataclass
 class Session:
     id: str
     agent: str
@@ -70,6 +83,7 @@ class Session:
     prompts: list[Prompt] = field(default_factory=list)
     edits: list[Edit] = field(default_factory=list)
     reads: list[Read] = field(default_factory=list)
+    hints: list[Hint] = field(default_factory=list, repr=False)
 
 
 class Source(Protocol):

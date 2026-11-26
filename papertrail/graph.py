@@ -11,7 +11,7 @@ from tempfile import TemporaryDirectory, TemporaryFile
 
 import relate
 
-from .replay import histories
+from .replay import hint_names, histories
 
 
 def select(sessions, project):
@@ -46,13 +46,31 @@ def select(sessions, project):
                 selected.add(sid)
                 if earlier.moved_from:
                     pending.append((earlier.moved_from, earlier.ts))
-    keep = set(selected)
-    for key in selected:
-        parent = by_id[key].parent
-        while parent in by_id and parent not in keep:
-            keep.add(parent)
-            parent = by_id[parent].parent
-    return [s if s.id in selected else replace(s, edits=[]) for s in sessions if s.id in keep]
+    paths = {p for sid in selected for e in by_id[sid].edits for p in (e.path, e.moved_from) if p}
+    hinted = {
+        s.id for s in sessions if s.id not in selected
+        and any(hint_names(h, path) for h in s.hints for path in paths)
+    }
+    def with_parents(keys):
+        keep = set(keys)
+        for key in keys:
+            parent = by_id[key].parent
+            while parent in by_id and parent not in keep:
+                keep.add(parent)
+                parent = by_id[parent].parent
+        return keep
+
+    original_keep = with_parents(selected)
+    keep = with_parents(original_keep | hinted)
+    result = []
+    for s in sessions:
+        if s.id in selected:
+            result.append(s)
+        elif s.id in keep:
+            # Preserve the replay inputs that project selection used before
+            # hints. Newly included sessions only supply attribution evidence.
+            result.append(replace(s, edits=[], reads=s.reads if s.id in original_keep else []))
+    return result
 
 
 # Stands for the folder a portable graph was built in. See `build`.
@@ -166,7 +184,7 @@ def collect_rows(sessions, nodes, edges, stage):
     ids = {s.id for s in sessions}
     for s in sessions:
         nodes["Session"].append(
-            {k: v for k, v in vars(s).items() if k not in ("edits", "prompts", "reads")}
+            {k: v for k, v in vars(s).items() if k not in ("edits", "prompts", "reads", "hints")}
         )
         link("Agent", "RAN", "Session", s.agent, s.id)
         if s.parent in ids:
@@ -194,6 +212,8 @@ def collect_rows(sessions, nodes, edges, stage):
         for a, b in pairwise(ordered):
             link("Edit", "NEXT", "Edit", a.id, b.id)
     edit_rows, unplaced = nodes["Edit"], set()
+    hints = {h.id: (s.id, h) for s in sessions for h in s.hints}
+    used_hints = set()
     if stage:
         stage("replay")
     for f in histories(sessions):
@@ -210,11 +230,28 @@ def collect_rows(sessions, nodes, edges, stage):
             }
         )
         for h in f.hunks:
-            nodes["Hunk"].append(
-                {k: v for k, v in vars(h).items() if k not in ("edit", "replaced")}
-            )
+            row = {
+                k: v for k, v in vars(h).items()
+                if k not in ("edit", "replaced", "inferred_from", "basis", "was")
+            }
+            if h.kind == "inferred":
+                row.update(basis=h.basis, was=h.was)
+            nodes["Hunk"].append(row)
             link("File", "HAS_HISTORY", "Hunk", f.path, h.id)
-            if h.edit:
+            if h.basis == "command":
+                sid, hint = hints[h.inferred_from]
+                if hint.id not in used_hints:
+                    nodes["Hint"].append({
+                        k: getattr(hint, k) for k in ("id", "seq", "ts", "tool", "model", "effort")
+                    })
+                    link("Session", "HAS_HINT", "Hint", sid, hint.id)
+                    if hint.prompt:
+                        link("Prompt", "LED_TO", "Hint", hint.prompt, hint.id)
+                    used_hints.add(hint.id)
+                link("Hunk", "INFERRED_FROM", "Hint", h.id, hint.id)
+            elif h.basis == "nearby":
+                link("Hunk", "INFERRED_FROM", "Edit", h.id, h.inferred_from)
+            elif h.edit:
                 link("Edit", "HAS_HUNK", "Hunk", h.edit, h.id)
             for old, count in h.replaced.items():
                 link("Hunk", "REPLACED", "Hunk", h.id, old, lines=count)

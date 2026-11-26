@@ -181,8 +181,10 @@ CREATE (:PaperTrail {version:1}), (f:File {id:'story', path:'story'}),
 """)
     with web.ReaderQueries(store) as q:
         legacy = q.db.execute(LEGACY_TRACKS, {"path": "story"}).data()
-        assert q._tracks("story") == legacy
-        assert q._tracks("story") == legacy  # Reuses the same edges for the next view.
+        for _ in range(2):  # Reuses the same edges for the next view.
+            tracks = q._tracks("story")
+            assert [{k: row[k] for k in legacy[0]} for row in tracks] == legacy
+            assert all(row["basis"] is None and row["was"] is None for row in tracks)
         crossings = q.db.execute(LEGACY_CROSSINGS).data()
         assert q.crossings()["rows"] == crossings
         for limit in (1, 2, 3, 4):

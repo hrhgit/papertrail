@@ -87,7 +87,7 @@ HELP = {
     "trace": "Follow one line back through every change that replaced it.",
     "session": "List one session's instructions and edits in order.",
     "crossings": "List the spots that two or more sessions rewrote.",
-    "stats": "Count what the graph holds and how many lines have a known writer.",
+    "stats": "Count graph records and report proven and inferred line coverage.",
 }
 EXAMPLES = """examples:
   papertrail ingest --project .          build .papertrail/graph.rl for this folder
@@ -211,8 +211,9 @@ def model_label(row):
     return f"{model} ({effort})" if model and effort else model or effort
 
 
-# What a row means when no session wrote the lines.
+# What a row means when the writer isn't proven.
 KINDS = {
+    "inferred": "likely writer based on a command or nearby edit",
     "baseline": "already there when agents first read the file",
     "external": "changed between two recorded edits, outside any session",
     "drift": "changed on disk after the last recorded edit",
@@ -225,9 +226,10 @@ def when(ts):
     return f"{ts[:19].replace('T', ' ')} UTC" if ts else ""
 
 
-def clip(text, width):
+def clip(text, width, *, collapse=True):
     """One line of at most `width` characters."""
-    text = " ".join((text or "").split())
+    if collapse:
+        text = " ".join((text or "").split())
     return text if len(text) <= width else text[: max(width - 1, 1)] + "…"
 
 
@@ -248,7 +250,11 @@ def heading(r):
     title = " ".join((r["title"] or "").split())
     if title and " ".join((r["prompt"] or "").split()).startswith(title[:40]):
         title = ""
-    parts = (r["agent"], model_label(r), when(r["ts"]), r["session"][:8], clip(title, 50))
+    agent = r["agent"]
+    if r["kind"] == "inferred":
+        basis = {"command": "named by a command", "nearby": "nearest recorded edit"}
+        agent = f"Likely {agent} ({basis.get(r.get('basis'), KINDS['inferred'])})"
+    parts = (agent, model_label(r), when(r["ts"]), r["session"][:8], clip(title, 50))
     return "  ".join(x for x in parts if x)
 
 
@@ -270,7 +276,7 @@ def display(command, result):
     for r in result["rows"]:
         if command == "blame":
             span = str(r["start"]) if r["start"] == r["end"] else f"{r['start']}-{r['end']}"
-            print(f"{span:<9} {heading(r)}")
+            print(f"{span:<9} {clip(heading(r), width - 10, collapse=False)}")
             if r["session"]:
                 # The query returns the first 80 characters.
                 asked = r["prompt"] or "(instruction unknown)"
@@ -278,7 +284,8 @@ def display(command, result):
             for n in range(r["start"], r["end"] + 1) if code else ():
                 print(f"{n:>7} │ {code[n - 1]}" if n <= len(code) else f"{n:>7} │")
         elif command == "trace":
-            print(f"[{r['depth']}] {heading(r)}")
+            prefix = f"[{r['depth']}] "
+            print(prefix + clip(heading(r), width - len(prefix), collapse=False))
             print(
                 "    Lineage  ",
                 " <- ".join("#" + key.rsplit("#", 1)[-1] for key in r["chain"]),

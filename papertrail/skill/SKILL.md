@@ -5,7 +5,7 @@ description: Find which coding-agent session wrote a line of code, the human ins
 
 # Paper Trail
 
-Paper Trail keeps a local graph of every edit that Claude Code and Codex sessions made in this project. Each current line points to the edit that wrote it, the instruction the human gave before that edit, and the earlier edits it replaced. Git shows that a line changed. This shows what the human asked for when it changed.
+Paper Trail keeps a local graph of edits recorded from Claude Code and Codex. A current line can point to a recorded edit or a likely writer, along with the associated instruction and the earlier edits it replaced.
 
 Run the commands from the project root. They only read the graph and never call a model.
 
@@ -22,12 +22,13 @@ Look before you change or remove code that you did not write in this conversatio
 Each row covers a range of current lines: `start`, `end`, `kind`, `agent`, `model`, `ts`, `session`, `title` and `prompt`, the instruction that led to the edit. `kind` says how far to trust the row:
 
 - `agent`: a recorded tool call wrote these lines. `prompt` is the request behind them.
+- `inferred`: a best guess at the writer. `basis` is `command` when a successful command named the file or `nearby` when the session made the nearest recorded edit to the file. `was` gives the original kind.
 - `baseline`: the lines were already there when agents first read the file.
 - `external`: the lines changed between two recorded edits, outside any session. A person or another tool wrote them.
 - `drift`: the lines changed on disk after the last recorded edit, outside any session. The time is unknown.
 - `unknown`: the logs do not establish an author.
 
-Only `agent` rows carry an instruction. Do not present any other row as a reason.
+Treat inferred rows and their prompts as weaker evidence. Use them to locate a conversation and look for direct evidence before relying on its instruction as the reason for the line.
 
 Line numbers are those of the file when the graph was built. `blame`, `trace` and `crossings FILE` return `"stale": true` when the file has changed since then, including by you in this conversation. The rows may then describe other lines, so rebuild the graph first (see Errors).
 

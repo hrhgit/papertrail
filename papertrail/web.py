@@ -35,7 +35,7 @@ import relate
 
 from .graph import build, portable_root, select
 from .logfile import open_log
-from .queries import Queries, file_version
+from .queries import FIELDS, INFERENCE_OWNER, OWNER, Queries, file_version
 from .sources import DEFAULT_LOGS, SOURCES, ReadProgress, load_sources
 from .transcript import conversation, conversation_version, written_diff
 
@@ -102,16 +102,16 @@ RETURN s.id AS id, parent.id AS parent, count(*) AS links"""
 
 # One row per deletion still between two current lines. `after` counts the lines
 # above the spot. `wrote` lists who wrote the deleted lines and how many each.
-GAPS = """
+GAPS = ("""
 MATCH (f:File {id:$path})-[:HAS_GAP]->(g:Gap)-[:FROM]->(h:Hunk)
-OPTIONAL MATCH (s:Session)-[:HAS_EDIT]->(e:Edit)-[:HAS_HUNK]->(h)
+""" + OWNER + """
 OPTIONAL MATCH (h)-[r:REPLACED]->(old:Hunk)
 OPTIONAL MATCH (old)<-[:HAS_HUNK]-(written:Edit)<-[:HAS_EDIT]-(writer:Session)
-WITH g, h, e, s, collect(CASE WHEN old IS NULL THEN NULL
+WITH g, h, e, s, p, likely, evidence, instruction, collect(CASE WHEN old IS NULL THEN NULL
   ELSE {kind: old.kind, session: writer.id, edit: written.id, ts: old.ts, lines: r.lines} END) AS wrote
-RETURN g.id AS id, g.after AS after, h.id AS hunk, h.kind AS kind, h.ts AS ts,
-h.removed AS removed, h.removed_text AS text, e.id AS edit, s.id AS session, wrote
-ORDER BY after, ts, id"""
+RETURN g.id AS id, g.after AS after, h.id AS hunk, h.removed AS removed,
+h.removed_text AS text, coalesce(e.id, evidence.id) AS edit, wrote,
+""" + FIELDS + " ORDER BY after, ts, id")
 
 DELETED_TEXT = """
 MATCH (:File {id:$path})-[:HAS_GAP]->(g:Gap {id:$id})-[:FROM]->(h:Hunk)
@@ -167,24 +167,26 @@ RETURN CASE WHEN f.status IN ['missing', 'unreadable'] THEN f.status ELSE 'unkno
 sum(lines) AS lines ORDER BY lines DESC, kind"""
 
 # Every change on the lineage of a span of lines: one row per range and hunk.
-SPAN = """
+SPAN = ("""
 MATCH (f:File {id:$path})-[:HAS_RANGE]->(r:Range)-[:FROM]->(owner:Hunk)
 WHERE r.end >= $start AND r.start <= $end
 MATCH chain=(owner)-[:REPLACED*0..]->(h:Hunk)
-OPTIONAL MATCH (s:Session)-[:HAS_EDIT]->(e:Edit)-[:HAS_HUNK]->(h)
-OPTIONAL MATCH (p:Prompt)-[:LED_TO]->(e)
-RETURN r.start AS start, r.end AS end, length(chain) AS depth, h.id AS hunk, h.kind AS kind,
-h.ts AS ts, s.id AS session, s.agent AS agent, s.title AS title, s.cwd AS cwd, s.resume AS resume,
-s.resume_cwd AS resume_cwd, e.id AS edit, e.model AS model, p.id AS prompt_id, p.text AS prompt"""
+""" + OWNER + """
+RETURN r.start AS start, r.end AS end, length(chain) AS depth, h.id AS hunk,
+coalesce(s.cwd, likely.cwd) AS cwd, coalesce(s.resume, likely.resume) AS resume,
+coalesce(s.resume_cwd, likely.resume_cwd) AS resume_cwd,
+coalesce(e.id, evidence.id) AS edit, coalesce(p.id, instruction.id) AS prompt_id,
+""" + FIELDS)
 
 
 # Who wrote each current line of the files a search hit, to mark the hits.
-SEARCH_OWNERS = """
+SEARCH_OWNERS = ("""
 UNWIND $paths AS path
 MATCH (f:File {id:path})-[:HAS_RANGE]->(r:Range)-[:FROM]->(h:Hunk)
 OPTIONAL MATCH (h)<-[:HAS_HUNK]-(:Edit)<-[:HAS_EDIT]-(s:Session)
+""" + INFERENCE_OWNER + """
 RETURN f.path AS path, f.lines AS lines, r.start AS start, r.end AS end,
-h.kind AS kind, s.id AS session"""
+h.kind AS kind, coalesce(s.id, likely.id) AS session""")
 
 # `{text}` is the property as stored, or lowered when the search ignores case.
 SEARCH_PROMPTS = """
@@ -577,13 +579,17 @@ class ReaderQueries(Queries):
         self._bounds(info, start, end)
         stops, seen = {}, set()
         for row in self._run(SPAN, path=path, start=start, end=end):
-            agent = row["kind"] == "agent" and row["session"]
-            key = (row["session"], row["prompt_id"] or row["edit"]) if agent else (row["kind"],)
+            if row["kind"] == "inferred":
+                key = (row["kind"], row["basis"], row["was"], row["edit"])
+            elif row["kind"] == "agent" and row["session"]:
+                key = (row["session"], row["prompt_id"] or row["edit"])
+            else:
+                key = (row["kind"],)
             stop = stops.get(key)
             if stop is None:
                 stop = stops[key] = {
                     k: row[k]
-                    for k in ("kind", "ts", "session", "agent", "title", "cwd", "resume", "resume_cwd", "edit", "model", "prompt")
+                    for k in ("kind", "basis", "was", "ts", "session", "agent", "title", "cwd", "resume", "resume_cwd", "edit", "model", "effort", "tool", "prompt")
                 }
                 stop.update(lines=0, edits=set(), depth=row["depth"])
             if row["edit"]:

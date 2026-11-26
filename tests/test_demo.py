@@ -51,7 +51,11 @@ def graph(tmp_path_factory):
 def test_every_line_has_a_writer(graph):
     stats = graph.stats()["rows"][0]
     assert stats["sessions"] == 8 and stats["agents"] == 2
-    assert stats["lines"] == {"agent": 199, "baseline": 0, "external": 2, "drift": 2, "unknown": 0}
+    assert stats["lines"] == {
+        "agent": 199, "inferred": 4, "baseline": 0, "external": 0, "drift": 0, "unknown": 0,
+    }
+    assert stats["agent_fraction"] == 199 / 203
+    assert stats["agent_plus_inferred_fraction"] == 1
     assert stats["unapplied_patches"] == 0
     assert all(agent["unplaced"] == 0 for agent in stats["by_agent"].values())
 
@@ -75,8 +79,8 @@ def test_retry_limit_story(graph):
 
 
 def test_hand_edit_subagent_and_deletion(graph):
-    kinds = {r["kind"]: r for r in graph.blame(CONFIG)["rows"]}
-    assert (kinds["external"]["start"], kinds["external"]["end"]) == (9, 10)
+    (row,) = [r for r in graph.blame(CONFIG)["rows"] if r["was"] == "external"]
+    assert (row["kind"], row["basis"], row["start"], row["end"]) == ("inferred", "nearby", 9, 10)
     # The tests were written by a subagent. Its lines lead back to the parent's instruction.
     row = graph.blame(PROJECT / "tests/test_delivery.py", 1, 1)["rows"][0]
     assert row["prompt"].startswith("Add tests for the retry loop.")
