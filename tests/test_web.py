@@ -418,6 +418,24 @@ def test_background_build_failure_is_reported(tmp_path, monkeypatch):
     reader.close()
 
 
+def test_unexpected_build_failure_logs_frames_without_message(tmp_path, monkeypatch, capsys):
+    from papertrail import ingest
+
+    (tmp_path / "project").mkdir()
+    reader = Reader(project=tmp_path / "project")
+
+    def broken(store, sessions, **kwargs):
+        raise KeyError("-".join(["private", "prompt"]))
+
+    monkeypatch.setattr(ingest, "build", broken)
+    reader.start_build(tmp_path / "project", roots={"claude-code": FIXTURE / "logs"})
+    assert finished(reader)["stage"] == "failed"
+    reader.close()
+    err = capsys.readouterr().err
+    assert "Paper Trail build failed (KeyError)." in err and "in broken" in err
+    assert "private-prompt" not in err
+
+
 def test_closing_the_reader_stops_a_running_build(tmp_path, monkeypatch):
     (tmp_path / "project").mkdir()
     reader = Reader(project=tmp_path / "project")
@@ -433,7 +451,7 @@ def test_closing_the_reader_stops_a_running_build(tmp_path, monkeypatch):
     assert not list(store_dir.glob(".papertrail-build-*"))
 
 
-@pytest.mark.parametrize("action", ["finish", "switch", "rebuild"])
+@pytest.mark.parametrize("action", ["finish", "switch", "rebuild", "reopen"])
 def test_reader_uses_quick_graph_during_full_pass(tmp_path, monkeypatch, action):
     project, roots = preview_roots(tmp_path)
     arrived, release = held_build(monkeypatch, "full")
@@ -455,8 +473,11 @@ def test_reader_uses_quick_graph_during_full_pass(tmp_path, monkeypatch, action)
         elif action == "rebuild":
             reader.start_build(project, roots=roots)
             assert reader.job is not first
+        elif action == "reopen":
+            assert reader.open(project)["building"]
+            assert reader.job is first and first.running
         release.set()
-        if action != "finish":
+        if action not in ("finish", "reopen"):
             assert first.ended.wait(10) and first.status()["phase"] == "cancelled"
         if action == "switch":
             assert not reader.open(project)["complete"]

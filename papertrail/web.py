@@ -782,8 +782,10 @@ class BuildJob(ReadProgress):
                 pass
         except Exception as exc:
             if not isinstance(exc, (ValueError, OSError, relate.Error, BuildCancelled)):
-                # Parse exceptions can contain private log content.
-                print(f"Paper Trail build failed ({type(exc).__name__}).", file=sys.stderr)
+                # Parse exceptions can contain private log content, so print where it
+                # failed (Paper Trail's own code) without the exception message.
+                frames = "".join(traceback.format_list(traceback.extract_tb(exc.__traceback__)))
+                print(f"Paper Trail build failed ({type(exc).__name__}).\n{frames}", file=sys.stderr, end="")
             self.error = exc
         finally:
             with self.lock:
@@ -971,11 +973,14 @@ class Reader:
             self._open_folder(requested.resolve())
             return self.workspace()
 
-    def _open_folder(self, folder):
+    def _open_folder(self, folder, rebuild=False):
         if not folder.is_dir():
             raise ValueError("Folder missing. Pick an existing folder.")
         if self.closed:
             raise ValueError("The reader is shutting down.")
+        if self.building and not rebuild and folder == Path(self.job.project).resolve():
+            # Reopening the folder being built keeps its background pass running.
+            return
         if self.building:
             if self.job.status()["phase"] == "quick":
                 raise ValueError("Wait for the first pass to finish, then open another folder.")
@@ -1021,7 +1026,7 @@ class Reader:
 
     def _new_job(self, folder, roots, portable=None):
         requested = Path(folder).expanduser()
-        self._open_folder(requested.resolve())
+        self._open_folder(requested.resolve(), rebuild=True)
         if roots is not None or portable is not None:
             self.build_options[self.project] = (roots, portable)
         roots, portable = self.build_options.get(self.project, (None, None))
