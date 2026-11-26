@@ -673,10 +673,15 @@ def test_session_line_fates_account_for_every_written_line(tmp_path):
     build(path, [first, other])
     with ReaderQueries(path) as q:
         (summary,) = [row for row in q.overview()["sessions"] if row["id"] == "first"]
+        touched = {row["path"]: row["touched"] for row in q.overview()["files"]}
         conv = q.conversation("first")
         assert q._run("MATCH (e:Edit {id:'13', unplaced:true}) RETURN e.id AS id") == [{"id": "13"}]
 
     assert (summary["written"], summary["alive"]) == (16, 3)
+    # The mover belongs to the file it moved away; the first writer follows its line to the new path.
+    assert touched[str(old)] == ["first", "other"]
+    assert touched[str(moved)] == ["first", "other"]
+    assert touched[str(deleted)] == ["first", "other"]
     assert {row["path"]: row["lines"] for row in conv["alive_in"]} == {str(main): 2, str(moved): 1}
     assert {(r["session"], r["kind"]): r["lines"] for r in conv["replaced"]} == {
         ("first", "agent"): 1, ("other", "agent"): 4, (None, "external"): 1, (None, "drift"): 1,

@@ -71,6 +71,22 @@ OPTIONAL MATCH (s:Session)-[:HAS_EDIT]->(e:Edit)-[:TOUCHED]->(f)
 RETURN f.path AS path, f.status AS status, f.lines AS lines, agent_lines,
 count(DISTINCT e) AS edits, count(DISTINCT s) AS sessions ORDER BY path"""
 
+# Where each session's lines sit in each file now.
+FILE_AUTHORS = """
+MATCH (f:File)-[:HAS_RANGE]->(r:Range)-[:FROM]->(:Hunk)<-[:HAS_HUNK]-(:Edit)<-[:HAS_EDIT]-(s:Session)
+RETURN f.path AS path, s.id AS id, r.start AS start, r.end AS end ORDER BY path, start"""
+
+# Every session that edited each file, whether or not its lines are still there.
+FILE_SESSIONS = """
+MATCH (s:Session)-[:HAS_EDIT]->(e:Edit)-[:TOUCHED]->(f:File)
+RETURN f.path AS path, s.id AS id, count(e) AS edits ORDER BY path, id"""
+
+# A move only touches where the file went; this is where it came from.
+FILE_MOVES = """
+MATCH (s:Session)-[:HAS_EDIT]->(e:Edit)
+WHERE e.moved_from IS NOT NULL
+RETURN e.moved_from AS path, s.id AS id ORDER BY path, id"""
+
 SESSIONS = """
 MATCH (s:Session)
 OPTIONAL MATCH (s)-[:HAS_EDIT]->(e:Edit)
@@ -480,6 +496,24 @@ class ReaderQueries(Queries):
         self._begin()
         stats = self._stats()
         files = self._run(FILES)
+        authors = {}
+        for row in self._run(FILE_AUTHORS):
+            spans = authors.setdefault(row["path"], [])
+            # Touching runs by the same session read as one stretch.
+            if spans and spans[-1][0] == row["id"] and spans[-1][2] + 1 >= row["start"]:
+                spans[-1][2] = max(spans[-1][2], row["end"])
+            else:
+                spans.append([row["id"], row["start"], row["end"]])
+        # A session belongs to a file it edited, moved away, or still has lines
+        # in: lines follow a file through a move another session made.
+        touched = {}
+        for row in self._run(FILE_SESSIONS) + self._run(FILE_MOVES):
+            touched.setdefault(row["path"], set()).add(row["id"])
+        for path, spans in authors.items():
+            touched.setdefault(path, set()).update(span[0] for span in spans)
+        for row in files:
+            row["authors"] = authors.get(row["path"], [])
+            row["touched"] = sorted(touched.get(row["path"], ()))
         sessions = self._overview_sessions()
         written = {row["id"]: row["written"] for row in self._run(WRITTEN)}
         alive = {row["id"]: row["alive"] for row in self._run(ALIVE)}
