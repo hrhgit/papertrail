@@ -1,7 +1,7 @@
 "use strict";
 
 const PALETTE = ["#d7352b", "#1f6fd1", "#0e9f5b", "#e9a100", "#8a4fbf", "#0097a7", "#d63a8c", "#8c5a33", "#5e8f1e", "#e5652a"];
-// Short names on screen; the full meaning is the tooltip. The legend in index.html matches.
+// Short names on screen; the full meaning is the tooltip. The legend popover in index.html matches.
 const KIND = {
   baseline: { who: "Pre-existing", tip: "In the file before the first recorded session", cls: "k-baseline" },
   external: { who: "External edit", tip: "Changed outside the agents, between two recorded edits", cls: "k-external" },
@@ -128,6 +128,17 @@ function sourceLogo(agent) {
     svg.append(path);
   }
   return svg;
+}
+
+// "claude-fable-5-2" reads as "Fable 5.2"; a name it can't parse is shown as is.
+function modelName(model) {
+  if (!model) return "";
+  const cap = (w) => w[0].toUpperCase() + w.slice(1);
+  let m = /^claude-([a-z]+)-(\d+)(?:-(\d{1,2}))?(?:-\d{8})?$/.exec(model);
+  if (m) return `${cap(m[1])} ${m[2]}${m[3] ? "." + m[3] : ""}`;
+  m = /^claude-(\d+)(?:-(\d{1,2}))?-([a-z]+)(?:-\d{8})?$/.exec(model);
+  if (m) return `${cap(m[3])} ${m[1]}${m[2] ? "." + m[2] : ""}`;
+  return model;
 }
 
 // An icon and a number. The words are the tooltip and what a screen reader hears.
@@ -399,8 +410,6 @@ function renderSummary() {
   const pct = s.agent_fraction == null ? null : Math.round(s.agent_fraction * 100);
   $("summary").replaceChildren(
     stat("chat", s.sessions, "session", true),
-    stat("pencil", s.edits, "edit", true),
-    stat("file", s.files, "file", true),
     pct == null
       ? ""
       : h("span", { class: "stat", title: `${pct}% of current lines were written by agents` }, h("span", { class: "share" }, h("i", { style: `width:${pct}%` })), `${pct}% agent-written`),
@@ -500,11 +509,13 @@ function updateFoldButton() {
 
 function fileRow(e, depth, label = base(e.path)) {
   const f = e.graph;
-  const share = f?.lines ? f.agent_lines / f.lines : 0;
   const gone = f?.status === "missing" ? "deleted" : f?.status === "unreadable" ? "unreadable" : null;
-  const tip = f
-    ? `${rel(e.path)}\n${plural(f.lines || 0, "line")} · ${plural(f.sessions, "session")} · ${plural(f.edits, "edit")} · ${Math.round(share * 100)}% agent-written`
-    : rel(e.path);
+  const by = f?.edits
+    ? f.lines
+      ? `${f.agent_lines.toLocaleString()} of ${plural(f.lines, "line").replace(/^\d+/, f.lines.toLocaleString())} by ${plural(f.sessions, "session")}`
+      : `Edited by ${plural(f.sessions, "session")}`
+    : null;
+  const tip = by ? `${rel(e.path)}\n${by}` : rel(e.path);
   return h(
     "button",
     {
@@ -517,7 +528,23 @@ function fileRow(e, depth, label = base(e.path)) {
       onclick: () => openFile(e.path),
     },
     h("span", { class: "name" }, label, gone ? h("span", { class: "tag" }, gone) : null),
-    f?.lines ? h("span", { class: "share" }, h("i", { style: `width:${share * 100}%` })) : null,
+    f?.lines ? authorShare(f) : null,
+  );
+}
+
+const byStart = (ids) =>
+  ids.sort((a, b) => String(state.sessions.get(a)?.started_at || "").localeCompare(String(state.sessions.get(b)?.started_at || "")));
+
+// The file from top (left) to bottom (right), with each session's current
+// lines painted in its color where they sit; the rest stays grey.
+function authorShare(f) {
+  const total = Math.max(f.lines || 0, ...(f.authors || []).map((a) => a[2]), 1);
+  return h(
+    "span",
+    { class: "share authors" },
+    (f.authors || []).map(([id, start, end]) =>
+      h("i", { style: `left:${((start - 1) / total) * 100}%;width:${((end - start + 1) / total) * 100}%;background:${color(id)}` }),
+    ),
   );
 }
 
@@ -692,6 +719,40 @@ function dots(ids) {
   return h("span", { class: "dots" }, ids.slice(0, 6).map((id) => h("i", { class: "dot", style: `background:${color(id)}`, title: sessionLabel(id) })));
 }
 
+// A small bar the length of the file with a tick at every crossing, banded top
+// to bottom in the colors of the sessions that rewrote it. Hovering names the nearest one and
+// clicking jumps to it.
+const crossers = (spots) => (spots.crossers ??= new Set(spots.flatMap((r) => r.sessions)).size);
+
+// Hard-stopped vertical bands, one per session, oldest on top.
+function bands(ids) {
+  const step = 100 / ids.length;
+  return `linear-gradient(${ids.map((id, i) => `${color(id)} ${i * step}% ${(i + 1) * step}%`).join(", ")})`;
+}
+
+function crossStrip(path, spots, lines) {
+  const total = Math.max(lines || 0, ...spots.map((r) => r.end));
+  const at = (line) => `${((line - 1) / Math.max(total - 1, 1)) * 100}%`;
+  const near = (e) => {
+    const box = strip.getBoundingClientRect();
+    const line = 1 + ((e.clientX - box.left) / box.width) * (total - 1);
+    return spots.reduce((a, b) => (Math.abs(b.start - line) < Math.abs(a.start - line) ? b : a));
+  };
+  const label = (r) => `Line ${r.start}${r.end > r.start ? "-" + r.end : ""} · ${plural(r.session_count, "session")}`;
+  const strip = h(
+    "button",
+    {
+      type: "button",
+      class: "cross-strip",
+      "aria-label": `${plural(spots.length, "crossing")} in ${base(path)}`,
+      onmousemove: (e) => (strip.title = label(near(e))),
+      onclick: (e) => openFile(path, near(e).start),
+    },
+    spots.map((r) => h("i", { style: `left:${at(r.start)};background:${bands(byStart([...r.sessions]))}` })),
+  );
+  return strip;
+}
+
 function renderCrossings() {
   const box = $("tab-crossings");
   if (!state.overview) {
@@ -703,35 +764,37 @@ function renderCrossings() {
   if (!rows.length) {
     return box.replaceChildren(h("p", { class: "none" }, "No crossings yet"));
   }
-  // One entry per file; each crossing inside it is a small line chip.
+  // One row per file: who crossed there, where in the file, and how often.
   const byFile = new Map();
   for (const r of live) {
     if (!byFile.has(r.path)) byFile.set(r.path, []);
     byFile.get(r.path).push(r);
   }
-  const fileItem = ([path, spots]) =>
-    h(
+  const lengths = new Map((state.overview.files || []).map((f) => [f.path, f.lines]));
+  const fileItem = ([path, spots]) => {
+    spots.sort((a, b) => a.start - b.start);
+    const hottest = spots.reduce((a, b) => (b.session_count > a.session_count ? b : a));
+    return h(
       "div",
       { class: "item cross-file", "data-path": path, "aria-current": state.file?.path === path ? "true" : "false" },
-      h("button", { type: "button", class: "name", title: rel(path), onclick: () => openFile(path, spots[0].start) }, dots([...new Set(spots.flatMap((s) => s.sessions))]), base(path)),
       h(
-        "span",
-        { class: "chips" },
-        spots.map((r) =>
-          h(
-            "button",
-            {
-              type: "button",
-              class: r.session_count > 2 ? "chip many" : "chip",
-              title: `${r.session_count} sessions rewrote line ${r.start}${r.end > r.start ? "-" + r.end : ""}`,
-              onclick: () => openFile(path, r.start),
-            },
-            r.end > r.start ? `${r.start}-${r.end}` : r.start,
-          ),
-        ),
+        "button",
+        {
+          type: "button",
+          class: "name",
+          title: rel(path),
+          onclick: () => openFile(path, hottest.start),
+        },
+        h("span", { class: "base" }, base(path)),
       ),
+      crossStrip(path, spots, lengths.get(path)),
+      h("span", { class: "cross-count", title: `${plural(crossers(spots), "session")} · ${plural(spots.length, "crossing")}` }, crossers(spots)),
     );
-  const files = [...byFile.entries()];
+  };
+  // Files where the most sessions crossed come first.
+  const files = [...byFile.entries()].sort(
+    ([pa, a], [pb, b]) => crossers(b) - crossers(a) || b.length - a.length || base(pa).localeCompare(base(pb)),
+  );
   const here = files.filter(([p]) => inRoot(p));
   const away = files.filter(([p]) => !inRoot(p));
   const pastList = past.length
@@ -739,7 +802,7 @@ function renderCrossings() {
         "details",
         { class: "past" },
         h("summary", {}, "Replaced or deleted", h("span", { class: "count" }, past.length)),
-        past.map((r) => h("button", { type: "button", class: "item", title: rel(r.path), onclick: () => openFile(r.path) }, h("span", { class: "name" }, dots(r.sessions), base(r.path)))),
+        past.map((r) => h("button", { type: "button", class: "item", title: rel(r.path), onclick: () => openFile(r.path) }, h("span", { class: "name" }, base(r.path)))),
       )
     : null;
   box.replaceChildren(
@@ -759,7 +822,7 @@ const remainPct = (s) => Math.round((s.alive / s.written) * 100);
 function remainStat(s) {
   return h(
     "span",
-    { class: "stat remain", title: `${s.alive.toLocaleString()} of the ${plural(s.written, "line").replace(/^\d+/, s.written.toLocaleString())} it wrote are still in the files` },
+    { class: "stat remain", title: `${s.alive.toLocaleString()} of ${s.written.toLocaleString()} lines remain` },
     h("span", { class: "share" }, h("i", { style: `width:${remainPct(s)}%;background:${s.color}` })),
     `${remainPct(s)}%`,
   );
@@ -780,15 +843,13 @@ function renderSessions() {
         {
           class: "item session",
           "aria-current": state.focus === s.id ? "true" : "false",
-          title: [SOURCE_NAMES[s.agent] || s.agent, s.model].filter(Boolean).join(" · ") || null,
+          title: [SOURCE_NAMES[s.agent] || s.agent, s.model, when(s.started_at)].filter(Boolean).join(" · ") || null,
           onclick: () => openSession(s.id),
         },
         h("span", { class: "name" }, h("span", { class: "dots" }, h("i", { class: "dot", style: `background:${s.color}` })), sessionLabel(s.id), sourceLogo(s.agent) || ""),
         h(
           "span",
           { class: "meta" },
-          when(s.started_at),
-          stat("pencil", s.edits, "edit"),
           s.written ? remainStat(s) : null,
           helpers.has(s.id) ? stat("branch", helpers.get(s.id), "helper session") : null,
         ),
@@ -940,9 +1001,9 @@ function renderSearch() {
           ...r.prompts.map((p, i) =>
             h(
               "button",
-              { type: "button", class: "item hit-prompt", hidden: i >= PROMPT_HITS, title: sessionLabel(p.session), onclick: () => openSession(p.session, { prompt: p.ts }) },
+              { type: "button", class: "item hit-prompt", hidden: i >= PROMPT_HITS, title: [sessionLabel(p.session), when(p.ts)].filter(Boolean).join("\n"), onclick: () => openSession(p.session, { prompt: p.ts }) },
               h("span", { class: "name" }, marked(p)),
-              h("span", { class: "meta" }, h("i", { class: "dot", style: `background:${color(p.session)}` }), when(p.ts), p.edits ? stat("pencil", p.edits, "edit") : null),
+              h("span", { class: "meta" }, h("i", { class: "dot", style: `background:${color(p.session)}` }), p.edits ? stat("pencil", p.edits, "edit") : null),
             ),
           ),
           r.prompts.length > PROMPT_HITS
@@ -1589,6 +1650,7 @@ function clearFile() {
   $("file-title").textContent = base(state.root.replace(/\/$/, ""));
   $("file-note").hidden = true;
   $("hover").replaceChildren();
+  $("status-line").replaceChildren();
   $("lines").replaceChildren();
   $("find").hidden = true;
   paintSyntax();
@@ -1864,18 +1926,22 @@ function renderFile() {
   const name = dir.pop();
   $("file-title").replaceChildren(dir.length ? h("span", { class: "dir" }, dir.join("/") + "/") : "", name);
   const untracked = f.status === "untracked" && !f.note;
-  const note = $("file-note");
-  note.hidden = !f.note && !untracked;
-  note.classList.toggle("quiet", untracked);
-  // A file that changed after the build lines up again once the history is rebuilt.
+  // A file that changed after the build lines up again once the history is
+  // rebuilt; that is common while working, so it is a small tag, not a banner.
   const stale = f.note && f.lines && f.status !== "untracked" && state.workspace?.project;
+  const tag = $("stale-tag");
+  tag.hidden = !stale;
+  tag.title = stale ? f.note : "";
+  const note = $("file-note");
+  note.hidden = stale || (!f.note && !untracked);
+  note.classList.toggle("quiet", untracked);
   note.replaceChildren(
     ...(f.note ? [icon("alert"), h("span", {}, f.note)] : [untracked ? (state.overview ? "No agent edits" : "No history yet") : ""]),
-    stale ? h("button", { type: "button", onclick: () => buildHistory() }, "Rebuild") : "",
   );
   $("code-empty").hidden = !!f.lines;
   if (!f.lines) $("code-empty").textContent = f.note || "Empty file";
   renderFocus();
+  paintMix();
 
   let width = 1;
   for (const r of f.tracks) width = Math.max(width, Math.min(MAX_LANES, laneIds(r).length + (r.kind === "agent" ? 0 : 1)));
@@ -1982,17 +2048,15 @@ function lineRow(text, n) {
   );
 }
 
-// The agent's logo on the first line of each block one session owns. Hovering it
-// names the session and when it wrote the block; clicking it opens that step.
+// The agent's logo on the first line of each block one session owns. The status
+// bar names the session while the line is hovered; clicking the logo opens that step.
 function whoMark(range, n) {
   const id = range?.kind === "agent" ? laneIds(range)[0] : null;
   const prev = trackAt(state.file.tracks, n - 1);
   const s = id && state.sessions.get(id);
   const logo = s && (prev?.kind !== "agent" || laneIds(prev)[0] !== id) ? sourceLogo(s.agent) : null;
   if (!logo) return h("span", { class: "who" });
-  const title = sessionLabel(id);
-  const head = [SOURCE_NAMES[s.agent], title.length > 70 ? title.slice(0, 70) + "…" : title].join(" · ");
-  return h("span", { class: "who", "data-tip": [head, when(range.ts || s.started_at)].filter(Boolean).join("\n") }, logo);
+  return h("span", { class: "who" }, logo);
 }
 
 /* ---------- Deleted lines ---------- */
@@ -2069,7 +2133,7 @@ function gapBlock(g, after, source, more) {
       { class: "gap-head", title: kind ? GAP_TIP[g.kind] || kind.tip : null },
       h("span", { class: "tracks", "aria-hidden": "true" }),
       h("span", { class: "num" }),
-      h("span", { class: "gap-what" }, h("b", {}, `Deleted ${plural(g.removed, "line")}`), ...who, g.ts ? h("span", { class: "when" }, shortWhen(g.ts)) : null),
+      h("span", { class: "gap-what" }, h("b", {}, `Deleted ${plural(g.removed, "line")}`), ...who),
     ),
     source || h("div", { class: "gap-ln none" }, h("span", { class: "tracks" }), h("span", { class: "num" }), h("span", { class: "src" }, g.loading ? "Loading deleted lines…" : g.bodyError || "The logs don't show these lines' text")),
     more
@@ -2090,7 +2154,8 @@ function gapBlock(g, after, source, more) {
   );
 }
 
-const isGapOpen = (after) => state.showGaps || state.openGaps.has(after);
+// openGaps holds the spots flipped by hand, against whatever "show all" says.
+const isGapOpen = (after) => state.showGaps !== state.openGaps.has(after);
 
 function gapTextLines(g) {
   return g.bodyLines ??= g.text ? g.text.replace(/\n$/, "").split("\n") : [];
@@ -2169,12 +2234,9 @@ function toggleAllGaps() {
 }
 
 function toggleGap(after) {
-  if (state.showGaps) return;
   if (state.openGaps.has(after)) state.openGaps.delete(after);
-  else {
-    state.openGaps.add(after);
-    for (const g of state.gapsAt.get(after)) delete g.bodyError;
-  }
+  else state.openGaps.add(after);
+  if (isGapOpen(after)) for (const g of state.gapsAt.get(after)) delete g.bodyError;
   redrawGap(after);
 }
 
@@ -2189,7 +2251,6 @@ function describeGap(after) {
     `${plural(gapLines(list), "line")} deleted`,
     ids.length ? dots(ids) : h("i", { class: `key ${kind.cls}` }),
     h("span", { class: "owner" }, kind ? kind.who : sessionLabel(g.session)),
-    g.ts ? h("span", { class: "when" }, when(g.ts)) : "",
   ];
 }
 
@@ -2198,10 +2259,7 @@ function selectGap(after, { open = false, scroll = false, panel } = {}) {
   if (!list) return;
   state.line = null;
   state.gap = after;
-  if (open && !state.showGaps && !state.openGaps.has(after)) {
-    state.openGaps.add(after);
-    redrawGap(after);
-  }
+  if (open && !isGapOpen(after)) toggleGap(after);
   markSelected();
   if (scroll) scrollToFileRow(after, true);
   showPanel(panel || { view: "trace", path: state.file.path, gap: after });
@@ -2218,8 +2276,7 @@ function describeOwner(n) {
     const kind = KIND[range.kind] || KIND.unknown;
     return [num, h("i", { class: `key ${kind.cls}` }), kind.who, ids.length ? dots(ids) : ""];
   }
-  const s = state.sessions.get(ids[0]);
-  return [num, dots(ids), h("span", { class: "owner" }, sessionLabel(ids[0])), s ? h("span", { class: "when" }, when(s.started_at)) : ""];
+  return [num, dots(ids), h("span", { class: "owner" }, sessionLabel(ids[0]))];
 }
 
 // Runs of lines the focused session wrote or rewrote, top to bottom.
@@ -2265,7 +2322,7 @@ function renderFocus() {
   box.replaceChildren(
     ...[
       h("i", { class: "dot", style: `background:${color(state.focus)}` }),
-      h("span", { class: "focus-name", title: "Only this session's lines are highlighted" }, sessionLabel(state.focus)),
+      h("span", { class: "focus-name", title: sessionLabel(state.focus) }, sessionLabel(state.focus)),
       state.file?.lines
         ? h("span", { class: "focus-count", id: "focus-at", title: blocks.length ? `${plural(lines, "line")} in ${plural(blocks.length, "place")} in this file` : null }, blocks.length ? plural(lines, "line") : "No lines here")
         : null,
@@ -2290,6 +2347,7 @@ function setFocus(id, { save = true } = {}) {
     if (!$("tab-outline").hidden && outlineView.file === state.file) updateOutlineFocus();
   }
   renderFocus();
+  paintMix();
   renderSessions();
   if (save) writeHash();
 }
@@ -2466,21 +2524,27 @@ function renderTraceView() {
     if (pick >= 0) t.pick = pick;
   }
   const gap = t.gap != null;
-  const sessions = new Set(t.stops.map((r) => r.session).filter(Boolean));
   const count = gap ? `${t.stops.length} deletions here, newest first` : t.span ? `Lines ${t.span.line}–${t.span.end} · ${plural(t.stops.length, "change")}, newest first` : `${t.stops.length} changes, newest first`;
+  // The editor already marks the line, function or deletion, so the head is
+  // titled by who changed it: the session picker itself.
+  const titled = t.stops.length > 0;
+  const what = gap ? `Deleted ${gapWhere(t.n)}` : t.span ? `${t.span.kind || ""} ${t.span.name}`.trim() : `Line ${t.n}`;
+  const picker = t.stops.length ? historyChips(gap, titled) : null;
   const head = h(
     "div",
-    { class: "panel-head line-head" },
-    // The editor already shows the line itself; the head only says whose it is.
+    { class: "panel-head line-head", "aria-label": titled ? what : null },
     h(
       "div",
       { class: "head-row" },
-      h("h2", {}, gap ? `Deleted ${gapWhere(t.n)}` : t.span ? [t.span.kind ? h("span", { class: "okind" }, t.span.kind + " ") : null, h("code", {}, t.span.name)] : `Line ${t.n}`, sessions.size > 1 ? dots([...sessions]) : null),
-      t.stops.length > 1 || t.span ? h("span", { class: "head-count" }, count) : null,
+      titled
+        ? picker
+        : h("h2", {}, gap ? `Deleted ${gapWhere(t.n)}` : t.span ? [t.span.kind ? h("span", { class: "okind" }, t.span.kind + " ") : null, h("code", {}, t.span.name)] : `Line ${t.n}`),
+      // The chips below already show how many changes; the count stays a tooltip.
+      h("span", { class: "head-count", title: t.stops.length > 1 || t.span ? count : null }),
       h("button", { type: "button", class: "icon-btn bare", title: "Copy where this came from, as Markdown", "aria-label": "Copy where this came from", onclick: () => copy(originText(), "Copied") }, icon("copy")),
       h("a", { class: "icon-btn bare", href: `vscode://file${encodeURI(t.path)}:${Math.max(1, t.n)}`, title: "Open in VS Code", "aria-label": "Open in VS Code" }, icon("external")),
     ),
-    t.stops.length ? h("div", { class: "chips", role: "tablist", "aria-label": gap ? "Deletions at this spot, newest first" : "Changes to this line, newest first" }, t.stops.map((r, i) => historyChip(r, i))) : null,
+    titled ? null : picker,
     gap ? h("p", { class: "gap-origin", id: "gap-origin" }) : null,
   );
   const body = h("div", { class: "chat-body", id: "chat-body" });
@@ -2497,31 +2561,126 @@ function shortWhen(ts) {
   return d.toLocaleDateString(undefined, { year, month: "short", day: "numeric" });
 }
 
-function historyChip(r, i) {
+// One chip per session name, and one per kind of non-agent change, ordered by
+// its newest change. A chip holds every change of its own, newest first.
+function stopRuns(stops) {
+  const key = (r) => (r.kind === "agent" && r.session ? "s:" + sessionLabel(r.session) : "k:" + r.kind);
+  const runs = new Map();
+  stops.forEach((r, i) => {
+    if (!runs.has(key(r))) runs.set(key(r), { idx: [] });
+    runs.get(key(r)).idx.push(i);
+  });
+  return [...runs.values()];
+}
+
+// Who changed the line, as a dropdown: the button shows the change on screen,
+// the list every writer, newest first. Arrows step through one writer's changes.
+function historyChips(gap, titled = false) {
+  const t = state.trace;
+  const runs = stopRuns(t.stops);
+  t.runs = runs;
+  const label = gap ? "Deletions at this spot, newest first" : "Changes to this line, newest first";
+  const step = (by) => {
+    const run = runs.find((r) => r.idx.includes(t.pick));
+    const at = run.idx.indexOf(t.pick) + by;
+    if (at >= 0 && at < run.idx.length) showStop(run.idx[at]);
+  };
+  const face = h("summary", { class: "hpick-face", id: "hpick-face", "aria-label": label });
+  // The list names the agent sessions; changes made outside them only get counted.
+  const agents = runs.filter((run) => !runParts(run).kind);
+  const outside = t.stops.length - agents.reduce((n, run) => n + run.idx.length, 0);
+  const list = h(
+    "ol",
+    { class: "hpick-list", role: "listbox", "aria-label": label },
+    agents.map((run) => h("li", {}, historyRow(run))),
+    outside ? h("li", { class: "hpick-note" }, `${plural(outside, "change")} outside the agents`) : null,
+  );
+  t.single = !(agents.length > 1 || (agents.length && outside));
+  const pick = h("details", { class: t.single ? "hpick single" : "hpick", id: "hpick", ontoggle: (e) => e.target.open && closeOnOutside(e.target) }, face, list);
+  const arrows = h(
+    "span",
+    { class: "hpick-step", id: "hpick-step" },
+    h("button", { type: "button", class: "icon-btn bare", id: "hpick-newer", title: "Newer change", "aria-label": "Newer change", onclick: () => step(-1) }, "‹"),
+    h("span", { class: "hpick-n", id: "hpick-n" }),
+    h("button", { type: "button", class: "icon-btn bare", id: "hpick-older", title: "Older change", "aria-label": "Older change", onclick: () => step(1) }, "›"),
+  );
+  return h("div", { class: titled ? "hpick-row titled" : "hpick-row" }, pick, arrows);
+}
+
+// An open dropdown closes on a click anywhere outside it, or on Escape.
+function closeOnOutside(d) {
+  const close = (e) => {
+    if (e.type === "keydown" ? e.key !== "Escape" : d.contains(e.target)) return;
+    d.open = false;
+    document.removeEventListener("pointerdown", close, true);
+    document.removeEventListener("keydown", close, true);
+  };
+  document.addEventListener("pointerdown", close, true);
+  document.addEventListener("keydown", close, true);
+}
+
+function runParts(run) {
+  const r = state.trace.stops[run.idx[0]];
   const kind = r.kind === "agent" && r.session ? null : KIND[r.kind] || KIND.unknown;
-  const label = kind ? kind.who : sessionLabel(r.session);
+  return {
+    kind,
+    label: kind ? kind.who : sessionLabel(r.session),
+    mark: kind ? h("i", { class: `key ${kind.cls}` }) : h("i", { class: "dot", style: `background:${color(r.session)}` }),
+    day: shortWhen(r.ts),
+  };
+}
+
+function historyRow(run) {
+  const t = state.trace;
+  const { label, mark, day } = runParts(run);
+  const n = run.idx.length;
+  const lines = t.span ? run.idx.reduce((sum, i) => sum + (t.stops[i].lines || 0), 0) : 0;
   return h(
     "button",
     {
       type: "button",
-      role: "tab",
-      class: kind ? "hchip quiet" : "hchip",
-      "aria-selected": String(i === state.trace.pick),
-      title: kind ? kind.tip : [label, when(r.ts), state.trace.span ? (r.lines ? `${plural(r.lines, "line")} here now` : "Rewritten since") : null, oneLine(r.prompt).slice(0, 200)].filter(Boolean).join("\n"),
-      onclick: () => showStop(i),
+      role: "option",
+      class: "hrow",
+      "data-stops": run.idx.join(" "),
+      "aria-selected": String(run.idx.includes(t.pick)),
+      title: [label, day, n > 1 ? plural(n, "change") : null, lines ? `${plural(lines, "line")} here now` : null].filter(Boolean).join(" · "),
+      onclick: (e) => {
+        e.currentTarget.closest("details").open = false;
+        if (!run.idx.includes(t.pick)) showStop(run.idx[0]);
+      },
     },
-    kind ? h("i", { class: `key ${kind.cls}` }) : h("i", { class: "dot", style: `background:${color(r.session)}` }),
+    mark,
     h("span", { class: "hchip-name" }, label),
-    h("span", { class: "hchip-when" }, shortWhen(r.ts)),
-    state.trace.span && !kind && r.lines ? h("span", { class: "count" }, r.lines) : null,
+    h("span", { class: "hrow-n" }, n > 1 ? n : ""),
   );
+}
+
+// The dropdown's button and arrows follow the change on screen.
+function paintPick() {
+  const t = state.trace;
+  const face = $("hpick-face");
+  if (!t?.runs || !face) return;
+  const run = t.runs.find((r) => r.idx.includes(t.pick));
+  if (!run) return;
+  const { kind, label, mark } = runParts(run);
+  const r = t.stops[t.pick];
+  face.title = [kind ? kind.tip : label, when(r.ts)].filter(Boolean).join("\n");
+  // replaceChildren would print a null as text, so the arrow is left out, not nulled.
+  face.replaceChildren(mark, h("span", { class: "hchip-name" }, label), ...(t.single ? [] : [h("span", { class: "hpick-chev", "aria-hidden": "true" })]));
+  document.querySelectorAll(".hrow").forEach((el) => el.setAttribute("aria-selected", String(el.dataset.stops.split(" ").includes(String(t.pick)))));
+  const n = run.idx.length;
+  const at = run.idx.indexOf(t.pick);
+  $("hpick-step").hidden = n < 2;
+  $("hpick-n").textContent = `${at + 1}/${n}`;
+  $("hpick-newer").disabled = at === 0;
+  $("hpick-older").disabled = at === n - 1;
 }
 
 function showStop(i, writer = null) {
   const t = state.trace;
   if (!t) return;
   t.pick = i;
-  document.querySelectorAll(".hchip").forEach((el, k) => el.setAttribute("aria-selected", String(k === i)));
+  paintPick();
   const r = t.stops[i];
   rememberPanel({ stop: { index: i, kind: r.kind, session: r.session, edit: r.edit }, writer: null });
   const body = $("chat-body");
@@ -2536,7 +2695,7 @@ function showStop(i, writer = null) {
         { class: "kind-note" },
         h("p", { class: "kind-who" }, h("i", { class: `key ${kind.cls}` }), kind.who),
         h("p", {}, (gap && GAP_TIP[r.kind]) || kind.tip),
-        r.ts ? h("p", { class: "when" }, r.kind === "external" ? `≈ ${when(r.ts)}, between two recorded edits` : when(r.ts)) : null,
+        r.ts ? h("p", { class: "when" }, r.kind === "external" ? `≈ ${when(r.ts)}` : when(r.ts)) : null,
       ),
     );
   }
@@ -2581,7 +2740,7 @@ function gapOrigin(r, restoreWriter) {
   const pick = (w) => {
     if (!w.session) return;
     rememberPanel({ writer: { session: w.session, edit: w.edit } });
-    for (const el of document.querySelectorAll(".hchip, .writer")) el.setAttribute("aria-selected", "false");
+    for (const el of document.querySelectorAll(".hrow, .writer")) el.setAttribute("aria-selected", "false");
     box.querySelector(`[data-session="${CSS.escape(w.session)}"]`)?.setAttribute("aria-selected", "true");
     showGapConversation($("chat-body"), r, w.session, { edit: w.edit, stop: { ...w, depth: 1 }, tag: "wrote the deleted lines" }, "add");
     return true;
@@ -2767,6 +2926,9 @@ function sessionBar(conv, box) {
   const s = conv.session;
   const resume = resumeCommand(s);
   const meta = [SOURCE_NAMES[s.agent] || s.agent, s.model, when(s.started_at)].filter(Boolean).join(" · ");
+  const logo = sourceLogo(s.agent);
+  const pill = logo || s.model ? h("span", { class: "model-pill", title: meta }, logo, h("span", {}, modelName(s.model) || SOURCE_NAMES[s.agent] || s.agent)) : null;
+  const fate = sessionFate(conv);
   const tool = (name, label, onclick, pressed) =>
     h("button", { type: "button", class: "icon-btn", title: label, "aria-label": label, "aria-pressed": pressed == null ? null : String(pressed), onclick }, icon(name));
   const highlight = tool("target", "Focus on this session: highlight only its lines in the file", () => {
@@ -2782,18 +2944,22 @@ function sessionBar(conv, box) {
     expand.title = label;
     expand.setAttribute("aria-label", label);
   });
+  // The picker above already names the session, unless this is the session
+  // that wrote lines another one deleted.
+  const named = !state.trace || conv.session.id !== state.trace.stops[state.trace.pick]?.session;
   return h(
     "div",
     { class: "chat-bar" },
     h(
       "div",
       { class: "bar-row" },
-      h("i", { class: "dot", style: `background:${color(s.id)}` }),
+      named ? h("i", { class: "dot", style: `background:${color(s.id)}` }) : null,
+      named ? null : pill,
+      named ? null : fate?.toggle,
       h(
         "div",
         { class: "bar-text" },
-        h("span", { class: "name", title: sessionLabel(s.id) }, sessionLabel(s.id)),
-        h("span", { class: "chat-meta" }, meta),
+        named ? h("span", { class: "name", title: sessionLabel(s.id) }, sessionLabel(s.id)) : null,
         s.parent ? h("span", { class: "chat-meta" }, "Helper of ", h("button", { type: "button", class: "link", onclick: () => openSession(s.parent) }, sessionLabel(s.parent))) : null,
       ),
       !state.trace && state.backTo
@@ -2802,13 +2968,15 @@ function sessionBar(conv, box) {
       h(
         "div",
         { class: "bar-tools" },
+        named ? pill : null,
+        named ? fate?.toggle : null,
         highlight,
         conv.items.length ? expand : null,
         conv.items.length ? tool("search", `Find in conversation (${MOD}F)`, openChatFind) : null,
         resume ? tool("terminal", `Copy the command that resumes this session: ${resume}`, () => copy(resume, "Copied")) : null,
       ),
     ),
-    sessionFate(conv),
+    fate?.body,
     conv.items.length ? chatFindBar() : null,
     conv.items.length ? h("button", { type: "button", class: "prompt-pin", hidden: true }, h("span", { class: "who" }), h("span", { class: "pin-text" })) : null,
   );
@@ -2854,25 +3022,26 @@ function sessionFate(conv) {
     ),
   );
   const more = (conv.alive_in || []).length - files.length;
-  return h(
-    "details",
-    { class: "fate" },
-    h(
-      "summary",
-      { title: "What became of the lines this session wrote" },
-      h("span", { class: "chev", "aria-hidden": "true" }),
-      h("span", { class: "share" }, h("i", { style: `width:${remainPct(s)}%;background:${s.color}` })),
-      h("span", {}, `${s.alive.toLocaleString()} of ${s.written.toLocaleString()} lines remain`),
-      h("span", { class: "fate-pct" }, `${remainPct(s)}%`),
-    ),
-    h(
+  const remain = `${s.alive.toLocaleString()} of ${s.written.toLocaleString()} lines remain`;
+  const body = h(
       "div",
-      { class: "fate-body" },
+      { class: "fate fate-body", hidden: true },
+      h("p", { class: "fate-sum" }, remain),
       ...(replaced.length ? [h("p", { class: "label" }, "Replaced or deleted by"), ...replaced] : []),
       ...(unaccounted.length ? [h("p", { class: "label" }, "No recorded outcome"), ...unaccounted] : []),
       ...(files.length ? [h("p", { class: "label" }, "Still standing in"), ...files, more > 0 ? h("p", { class: "fate-more" }, `and ${plural(more, "more file")}`) : null] : []),
-    ),
   );
+  // The bar alone says how much survived; a click shows where the rest went.
+  const toggle = h(
+    "button",
+    { type: "button", class: "icon-btn fate-toggle", title: remain, "aria-label": remain, "aria-expanded": "false" },
+    h("span", { class: "share" }, h("i", { style: `width:${remainPct(s)}%;background:${s.color}` })),
+  );
+  toggle.onclick = () => {
+    body.hidden = !body.hidden;
+    toggle.setAttribute("aria-expanded", String(!body.hidden));
+  };
+  return { toggle, body };
 }
 
 // The log is gone: fall back to what the graph kept, the instruction behind the change.
@@ -2909,7 +3078,7 @@ function chatFindBar() {
     "div",
     { class: "find chat-find", id: "chat-find", role: "search", hidden: true },
     input,
-    h("span", { class: "find-count", id: "chat-find-count", "aria-live": "polite", title: "Messages and steps that hold these words" }),
+    h("span", { class: "find-count", id: "chat-find-count", "aria-live": "polite" }),
     button("up", "Previous match (Shift+Enter)", () => stepChatFind(-1)),
     button("down", "Next match (Enter)", () => stepChatFind(1)),
     button("close", "Close (Esc)", closeChatFind),
@@ -3028,16 +3197,20 @@ function renderTurn(turn, view) {
       else blocks.push({ work: [item] });
     } else blocks.push({ item });
   }
+  // With a target step, only the replies around it stay open; the rest of the
+  // turn reads as one line each, and other turns start folded.
+  const at = view.step ? blocks.findIndex((b) => b.work?.includes(view.step)) : -1;
   const body = h(
     "div",
     { class: "turn-body" },
-    blocks.map((b) => {
+    blocks.map((b, k) => {
       if (b.work) return workGroup(b.work, view);
-      const el = message(b.item);
+      const el = message(b.item, at >= 0 && Math.abs(k - at) > 1 ? 2 : 24);
       view.show.set(b.item, () => el);
       return el;
     }),
   );
+  const away = view.step && at < 0;
   if (turn.user) {
     const steps = turn.items.filter((i) => i.kind === "tool").length;
     const replies = turn.items.filter((i) => i.kind === "assistant").length;
@@ -3053,6 +3226,16 @@ function renderTurn(turn, view) {
     li.append(bubble, folded);
     li.userItem = turn.user;
     view.show.set(turn.user, () => bubble);
+    if (away) {
+      li.classList.add("folded");
+      toggle.setAttribute("aria-expanded", "false");
+      toggle.title = "Unfold this turn";
+      // Find opens a folded turn before showing what it found there.
+      for (const item of turn.items) {
+        const show = view.show.get(item);
+        if (show) view.show.set(item, () => (li.classList.contains("folded") && toggle.click(), show()));
+      }
+    }
   }
   li.append(body);
   return li;
@@ -3063,15 +3246,15 @@ function userBubble(item, toggle) {
   return h(
     "div",
     { class: task ? "msg user task" : "msg user" },
-    h("div", { class: "msg-head" }, h("span", { class: "who" }, task ? "Task from the parent session" : "You"), h("span", { class: "when" }, when(item.ts)), toggle),
+    h("div", { class: "msg-head", title: when(item.ts) || null }, h("span", { class: "who" }, task ? "Task from the parent session" : "You"), toggle),
     clampText(md(item.text), item.text, 10),
     item.more ? h("p", { class: "cut" }, "Message cut short") : null,
   );
 }
 
-function message(item) {
+function message(item, lines = 24) {
   if (item.kind === "note") return h("div", { class: "chat-note" }, item.text);
-  return h("div", { class: "msg ai" }, clampText(md(item.text), item.text, 24), item.more ? h("p", { class: "cut" }, "Message cut short") : null);
+  return h("div", { class: "msg ai" }, clampText(md(item.text), item.text, lines), item.more ? h("p", { class: "cut" }, "Message cut short") : null);
 }
 
 function clampText(nodes, text, lines) {
@@ -3123,7 +3306,7 @@ function toolName(name) {
 const verb = (item) => TOOL_VERBS[item.name] || (/update_plan$/.test(item.name) ? "Updated plan" : toolName(item.name));
 
 function stepTarget(item) {
-  if (["Read", "Write", "Edit", "MultiEdit", "NotebookEdit"].includes(item.name)) return rel(item.summary);
+  if (["Read", "Write", "Edit", "MultiEdit", "NotebookEdit"].includes(item.name)) return item.summary === state.file?.path ? base(item.summary) : rel(item.summary);
   return item.summary;
 }
 
@@ -3137,15 +3320,13 @@ function workSummary(items) {
     else if (i.edits.length) for (const e of i.edits) !edited.includes(e.path) && edited.push(e.path);
     else counts[KIND_OF[i.name] || "other"]++;
   }
-  const parts = [];
-  if (edited.length) parts.push(`edited ${edited.slice(0, 2).map(base).join(", ")}${edited.length > 2 ? ` +${edited.length - 2}` : ""}`);
-  if (counts.read) parts.push(`read ${plural(counts.read, "file")}`);
-  if (counts.run) parts.push(`ran ${plural(counts.run, "command")}`);
-  if (counts.search) parts.push(`${counts.search} ${counts.search === 1 ? "search" : "searches"}`);
-  if (counts.other) parts.push(plural(counts.other, "other step"));
-  if (counts.think && !parts.length) parts.push("thought");
-  const text = parts.join(", ");
-  return text.charAt(0).toUpperCase() + text.slice(1);
+  const out = [];
+  if (edited.length) out.push(h("span", { class: "work-edit" }, `Edited ${base(edited[0])}${edited.length > 1 ? ` +${edited.length - 1}` : ""}`));
+  if (counts.read) out.push(stat("file", counts.read, "file read"));
+  if (counts.run) out.push(stat("terminal", counts.run, "command"));
+  if (counts.search) out.push(stat("search", counts.search, "search"));
+  if (!out.length && counts.think) out.push("Thought");
+  return out;
 }
 
 function workGroup(items, view) {
@@ -3166,7 +3347,7 @@ function workGroup(items, view) {
   const fill = () => {
     if (filled) return;
     filled = true;
-    det.append(h("ol", { class: "acts" }, items.map((i) => actRow(i, view))));
+    det.append(h("ol", { class: "acts" }, lookRuns(items, view).map((run) => (run.length > 1 ? lookGroup(run, view) : actRow(run[0], view)))));
   };
   det.addEventListener("toggle", () => det.open && fill());
   for (const i of items) {
@@ -3181,6 +3362,55 @@ function workGroup(items, view) {
     det.open = true;
   }
   return det;
+}
+
+// Steps that only looked at things: reading files, searching, or shell
+// commands such as sed -n, cat, rg and git log that write nothing.
+const LOOK_CMD = /^\s*(?:cd\s+\S+\s*(?:&&|;)\s*)?(?:sed\s+-n|cat|head|tail|nl|wc|ls|tree|find|rg|grep|git\s+(?:status|log|diff|show|blame))\b/;
+function looksOnly(item, view) {
+  if (item.kind !== "tool" || item === view.step || item.edits?.length || item.error) return false;
+  if (["Read", "Grep", "Glob"].includes(item.name)) return true;
+  return KIND_OF[item.name] === "run" && LOOK_CMD.test(item.summary || "") && !/>|\btee\b|\s-i\b/.test(item.summary || "");
+}
+
+// The one file a step changed, when it changed exactly one and is not the target.
+function editOnly(item, view) {
+  if (item.kind !== "tool" || item === view.step || item.error || !["Edit", "MultiEdit", "Write", "apply_patch", "NotebookEdit"].includes(item.name)) return null;
+  const paths = [...new Set((item.edits || []).map((e) => e.path))];
+  return paths.length === 1 ? paths[0] : null;
+}
+
+// Back-to-back look-only steps are grouped, and so are back-to-back edits of
+// one file; everything else stands alone.
+function lookRuns(items, view) {
+  const runs = [];
+  for (const i of items) {
+    const last = runs.at(-1);
+    const file = editOnly(i, view);
+    if (looksOnly(i, view) && last && looksOnly(last[0], view)) last.push(i);
+    else if (file && last && editOnly(last[0], view) === file) last.push(i);
+    else runs.push([i]);
+  }
+  return runs;
+}
+
+function lookGroup(items, view) {
+  const rows = items.map((i) => actRow(i, view));
+  const file = editOnly(items[0], view);
+  const name = file && (file === state.file?.path ? base(file) : rel(file));
+  const d = h(
+    "details",
+    {},
+    file
+      ? h("summary", {}, h("span", { class: "verb" }, "Edited"), h("span", { class: "what", title: rel(file) }, name), h("span", { class: "hrow-n", title: plural(items.length, "edit") }, items.length), h("span", { class: "tag pen" }, icon("pencil")))
+      : h("summary", {}, h("span", { class: "verb" }, "Looked"), h("span", { class: "what" }, `at files ${items.length} times`)),
+    h("ol", { class: "acts" }, rows),
+  );
+  for (const i of items) {
+    const show = view.rows.get(i);
+    view.rows.set(i, () => ((d.open = true), show()));
+  }
+  return h("li", { class: file ? "act looks wrote" : "act looks", style: `--line:${view.color}` }, d);
 }
 
 function actRow(item, view) {
@@ -3219,7 +3449,7 @@ function actRow(item, view) {
         ? h("span", { class: view.target.del ? "tag here cut" : "tag here" }, view.target.tag)
         : target
         ? h("span", { class: "tag here", title: view.target.stop?.depth ? "Later changes replaced what this step wrote on the line" : null }, view.target.stop?.depth ? `earlier line ${view.target.line}` : `wrote line ${view.target.line}`)
-        : item.edits.length ? h("span", { class: "tag pen", title: "Changed files still traced in the graph" }, icon("pencil")) : null,
+        : item.edits.length ? h("span", { class: "tag pen" }, icon("pencil")) : null,
     ),
   );
   let filled = false;
@@ -3387,10 +3617,22 @@ function bindTooltips() {
     return el && label(el) ? el : null;
   };
 
+  // A bubble only names a control that shows no words of its own. Everything
+  // else a pointer can ask about is answered in the status bar, in one place.
+  const bare = (el) => el.matches("button, a, [role=tab]") && !el.textContent.trim();
+  const bar = $("status-tip");
+  const line = $("status-line");
+  const tell = (words) => {
+    bar.textContent = words;
+    bar.hidden = !words;
+    line.hidden = !!words;
+  };
+
   const hide = () => {
     clearTimeout(timer);
     timer = 0;
     cancelAnimationFrame(frame);
+    tell("");
     if (!tip.hidden && tip.style.visibility !== "hidden") lastShown = Date.now();
     tip.hidden = true;
     if (owner && held != null && !owner.hasAttribute("title") && owner.isConnected) owner.setAttribute("title", held);
@@ -3419,6 +3661,7 @@ function bindTooltips() {
     owner = el;
     held = el.hasAttribute("title") ? el.getAttribute("title") : null;
     if (held != null) el.removeAttribute("title");
+    if (!bare(el)) return tell(words.replace(/\s*\n\s*/g, " · "));
     const go = () => {
       timer = 0;
       if (owner !== el || !el.isConnected) return hide();
@@ -3459,9 +3702,56 @@ function bindTooltips() {
 
 let clearCodeHover = null;
 
+// The file from top (left) to bottom (right), like the bars in the file tree
+// but wide enough to aim at: each session's lines sit where they are in the
+// file, and clicking a spot scrolls there.
+function fileMix() {
+  const f = state.file;
+  const n = f?.lines?.length || 0;
+  const runs = [];
+  for (const range of f?.tracks || []) {
+    if (range.start > n) break;
+    if (range.kind !== "agent") continue;
+    const id = laneIds(range)[0];
+    const end = Math.min(range.end, n);
+    const last = runs.at(-1);
+    if (last && last.id === id && last.end + 1 === range.start) last.end = end;
+    else runs.push({ id, start: range.start, end });
+  }
+  if (!runs.length) return [];
+  const go = (line) => scrollToFileRow(Math.max(0, Math.min(n, line) - 1));
+  return [
+    h(
+      "span",
+      {
+        class: "mix",
+        onclick: (e) => {
+          const box = e.currentTarget.getBoundingClientRect();
+          go(Math.round(((e.clientX - box.left) / box.width) * n) + 1);
+        },
+      },
+      runs.map((run) =>
+        h("i", {
+          class: `mix-part${state.focus && state.focus !== run.id ? " off" : ""}`,
+          style: `left:${((run.start - 1) / n) * 100}%;width:${((run.end - run.start + 1) / n) * 100}%;background:${color(run.id)}`,
+          title: `${sessionLabel(run.id)} · ${run.start === run.end ? `Ln ${run.start}` : `Ln ${run.start}–${run.end}`}`,
+          onclick: (e) => {
+            e.stopPropagation();
+            go(run.start);
+          },
+        }),
+      ),
+    ),
+  ];
+}
+
+function paintMix() {
+  $("hover")?.replaceChildren(...fileMix());
+}
+
 function bindCodeHover() {
   const list = $("lines");
-  const hover = $("hover");
+  const hover = $("status-line");
   let row = null, paintedRow = null, point = null, hit = null, rect = null;
   let frame = 0;
   const sameWord = (a, b) => a?.node === b?.node && a?.start === b?.start && a?.end === b?.end;
@@ -3538,11 +3828,20 @@ function bindEvents() {
     const gap = e.target.closest(".gap");
     if (!gap) return;
     const after = Number(gap.dataset.after);
-    if (e.target.closest(".gap-mark")) toggleGap(after);
+    if (e.target.closest(".gap-mark, .gap-head")) toggleGap(after);
     selectGap(after);
   });
   bindCodeHover();
   $("gaps-toggle").addEventListener("click", toggleAllGaps);
+  $("stale-tag").addEventListener("click", () => buildHistory());
+  // Raise the legend just above its button in the status bar, kept on screen.
+  $("legend").addEventListener("beforetoggle", (e) => {
+    if (e.newState !== "open") return;
+    const pop = $("legend"), at = $("legend-button").getBoundingClientRect();
+    pop.style.top = "auto";
+    pop.style.bottom = `${innerHeight - at.top + 6}px`;
+    pop.style.right = `${Math.max(8, innerWidth - at.right)}px`;
+  });
   $("code-scroll").addEventListener("keydown", (e) => {
     if (!state.file?.lines) return;
     // From a deletion, the arrows step to the line below or above it.
@@ -3629,7 +3928,7 @@ function bindEvents() {
     theme.replaceChildren(icon(themeIcons[t] || "auto"));
     const names = { auto: "Auto (follows your system)", light: "Light", dark: "Dark" };
     const next = themes[(themes.indexOf(t) + 1) % themes.length];
-    theme.title = `Theme: ${names[t] || names.auto}\nClick to switch to ${names[next].replace(/ \(.*/, "")}`;
+    theme.title = `Theme: ${names[t] || names.auto}`;
     theme.setAttribute("aria-label", `Theme: ${names[t] || names.auto}. Switch to ${names[next].replace(/ \(.*/, "")}`);
   };
   let current = "auto";

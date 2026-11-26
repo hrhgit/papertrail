@@ -28,7 +28,6 @@
   </div>
   <p class="summary" id="summary"></p>
   <div class="tools">
-    <button type="button" id="cypher-toggle" aria-pressed="false" title="The Cypher behind this view">Cypher</button>
     <button type="button" id="theme-toggle" class="icon-btn" title="Switch theme"></button>
   </div>
 </header>
@@ -53,15 +52,6 @@
       </div>
       <div id="search-results"></div>
     </div>
-    <ul class="legend" aria-label="Legend">
-      <li title="Each colored track is one agent session"><i class="key k-session"></i>Session</li>
-      <li title="Several sessions rewrote this spot; the newest is outermost"><i class="key k-crossing"></i>Crossing</li>
-      <li title="In the file before the first recorded session"><i class="key k-baseline"></i>Pre-existing</li>
-      <li title="Changed outside the agents, between two recorded edits"><i class="key k-external"></i>External edit</li>
-      <li title="Changed on disk after the last recorded edit"><i class="key k-drift"></i>Changed since</li>
-      <li title="Not enough evidence in the logs"><i class="key k-unknown"></i>Unknown</li>
-      <li title="Lines were deleted between these two lines. Click the mark to show them."><i class="key k-gap"></i>Deleted</li>
-    </ul>
   </nav>
 
   <section class="code" aria-label="File">
@@ -72,6 +62,17 @@
       <div class="title-row">
         <h1 id="file-title"></h1>
         <button type="button" id="gaps-toggle" class="gaps-toggle" aria-pressed="false" hidden></button>
+        <div id="legend" class="legend-pop" popover>
+          <ul class="legend" aria-label="Legend">
+            <li><i class="key k-session"></i><b>Session</b><span>One color per agent session</span></li>
+            <li><i class="key k-crossing"></i><b>Crossing</b><span>Rewritten by several sessions; newest outside</span></li>
+            <li><i class="key k-baseline"></i><b>Pre-existing</b><span>There before the first recorded session</span></li>
+            <li><i class="key k-external"></i><b>External edit</b><span>Changed outside the agents</span></li>
+            <li><i class="key k-drift"></i><b>Changed since</b><span>Changed on disk after the last edit</span></li>
+            <li><i class="key k-unknown"></i><b>Unknown</b><span>Not enough evidence in the logs</span></li>
+            <li><i class="key k-gap"></i><b>Deleted</b><span>Lines deleted here. Click to show.</span></li>
+          </ul>
+        </div>
       </div>
       <div class="find" id="find" role="search" hidden>
         <input id="find-input" type="text" autocomplete="off" spellcheck="false" placeholder="Find in file" aria-label="Find in file">
@@ -83,7 +84,7 @@
       </div>
       <div class="focus" id="focus" hidden></div>
       <p class="note" id="file-note" hidden></p>
-      <p class="hover" id="hover" aria-live="polite"></p>
+      <p class="hover" id="hover"></p>
     </div>
     <div class="code-scroll" id="code-scroll" tabindex="0" aria-label="File lines. Use the arrow keys to move between lines.">
       <div class="empty" id="code-empty"></div>
@@ -104,6 +105,14 @@
   </div>
   <div class="cypher-body" id="cypher-body"></div>
 </section>
+
+<footer class="status" aria-label="Status">
+  <p class="status-line" id="status-line" aria-live="polite"></p>
+  <p class="status-line status-tip" id="status-tip" hidden></p>
+  <button type="button" id="stale-tag" class="stale-tag" hidden>Outdated · Rebuild</button>
+  <button type="button" id="legend-button" class="status-btn" popovertarget="legend">Legend</button>
+  <button type="button" id="cypher-toggle" class="status-btn" aria-pressed="false" title="The Cypher behind this view">Cypher</button>
+</footer>
 
 <div class="server-notice" id="server-notice" hidden>
   <span id="server-notice-text" role="status"></span>
