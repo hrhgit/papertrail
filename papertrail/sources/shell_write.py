@@ -16,6 +16,13 @@ HEADERS = [
     re.compile(rf"cat\s+{HERE}\s*{DEST}"),
     re.compile(rf"tee\s+(?P<append>-a\s+)?(?P<path>{WORD})\s*{HERE}"),
 ]
+# A standalone echo with one literal argument and no options writes that
+# argument followed by a newline. Backslashes are shell-dependent.
+ECHO_WRITE = re.compile(
+    rf"""[ \t\n]*echo[ \t]+(?P<value>'[^'\\\n]*'|"[^"$`!\\\n]*"|[A-Za-z0-9_./]+)"""
+    rf"[ \t]+{DEST}[ \t\n]*"
+)
+MKDIR_PREFIX = re.compile(rf"[ \t\n]*mkdir[ \t]+-p[ \t]+({WORD})[ \t]*&&[ \t]*")
 CD = re.compile(rf"cd\s+(?:--\s+)?({WORD})")
 CONTROL = re.compile(
     r"(?:^|[;&|]\s*)(?:if|for|while|until|case|function|alias|eval|source|exec|exit|return|read|trap|set|pushd|popd|setopt|unsetopt|\.)(?:\s|$)|^\s*[({]|\w+\s*\(\s*\)"
@@ -98,14 +105,27 @@ def shell_commands(command):
 
 
 def shell_edits(
-    command, cwd, status, counts, *, session, key, seq, ts, prompt, model, effort, tool
+    command, cwd, status, counts, *, session, key, seq, ts, prompt, model, effort, tool,
+    standalone=False,
 ):
     if not isinstance(command, str):
         return []
     edits = []
     safe = True
     unknown_directory = False
-    for i, (header, body, closed, has_doc) in enumerate(shell_commands(command)):
+    echo = ECHO_WRITE.fullmatch(command)
+    commands = [(command.strip(), "", True, False)] if echo else shell_commands(command)
+    setup = MKDIR_PREFIX.match(command)
+    if setup and literal_path(setup[1], cwd):
+        # Success after && confirms the write when it is the last command.
+        following = list(shell_commands(command[setup.end() :]))
+        if len(following) == 1 and any(p.fullmatch(following[0][0]) for p in HEADERS):
+            commands = following
+    if standalone:
+        commands = list(commands)
+        if len(commands) != 1:
+            return []
+    for i, (header, body, closed, has_doc) in enumerate(commands):
         # Handle a literal cd on its own or guarding the next command with &&.
         if header == "cd":
             cwd = None
@@ -120,12 +140,14 @@ def shell_edits(
             unknown_directory = not cwd
             if not guard:
                 continue
+            if standalone and guard != "&&":
+                return []
             header = rest.strip()
         if header in ("set -e", "set -eu", "set -euo pipefail"):
             continue
         if CONTROL.search(header) or re.search(r"\b(?:alias|function)\s+(?:cat|tee)\b", header):
             safe = False
-        match = next((m for pattern in HEADERS if (m := pattern.fullmatch(header))), None)
+        match = echo or next((m for pattern in HEADERS if (m := pattern.fullmatch(header))), None)
         candidate = bool(re.search(r"(?:^|[;&|]\s*)(?:cat|tee)\s", header) and "<<" in header)
         if match:
             path = literal_path(match["path"], cwd)
@@ -144,10 +166,17 @@ def shell_edits(
                 )
             elif special_file(path):
                 reason = "special_file"
-            elif not match["quote"] and re.search(r"[$`]|\\[\\$`\n]", body):
+            elif not echo and not match["quote"] and re.search(r"[$`]|\\[\\$`\n]", body):
                 reason = "body_expansion"
             elif status != "success":
                 reason = status
+            elif echo:
+                (value,) = shlex.split(echo["value"])
+                if value.startswith("-"):
+                    # Even a quoted "-n", "-e", or "-E" is an echo option.
+                    reason = "echo_option"
+                else:
+                    body = value + "\n"
             if reason:
                 counts["shell_rejected_" + reason] += 1
                 continue

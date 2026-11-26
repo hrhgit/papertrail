@@ -121,3 +121,28 @@ def test_conversation_follows_log_compressed_after_build(tmp_path):
     plain.unlink()
     after = conversation(meta, [])
     assert before["items"] and after == before
+
+
+def test_truncated_compressed_rollout_is_not_a_partial_session(tmp_path, decoder):
+    folder = tmp_path / "cut" / "2025"
+    folder.mkdir(parents=True)
+    data = FIXTURE.read_bytes()
+    # A complete first frame guarantees the parser sees session metadata.
+    packed = compress(data) + compress(b"truncated frame\n")[:-1]
+    (folder / (FIXTURE.name + ".zst")).write_bytes(packed)
+    sessions, source = parsed(tmp_path / "cut")
+    assert sessions == []
+    assert source.failures["unreadable_rollout"] == 1
+    assert source.skipped["partial_rollout"] == 1
+
+
+def test_multi_frame_rollout_reads_whole(tmp_path, decoder):
+    data = FIXTURE.read_bytes()
+    cut = data.index(b"\n", len(data) // 2) + 1
+    root = tmp_path / "frames"
+    folder = root / "2025" / "01" / "01"
+    folder.mkdir(parents=True)
+    (folder / (FIXTURE.name + ".zst")).write_bytes(compress(data[:cut]) + compress(data[cut:]))
+    plain, _ = parsed(layout(tmp_path / "plain", False).parents[3])
+    packed, _ = parsed(root)
+    assert packed == plain

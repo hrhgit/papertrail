@@ -238,7 +238,11 @@ def command_string(command):
     if isinstance(command, str):
         return command
     if isinstance(command, list) and all(isinstance(x, str) for x in command):
-        if len(command) == 3 and command[1] in ("-lc", "-c"):
+        if (
+            len(command) == 3
+            and Path(command[0]).name in ("bash", "sh", "zsh")
+            and command[1] in ("-lc", "-c")
+        ):
             return command[2]
         return shlex.join(command)
     return ""

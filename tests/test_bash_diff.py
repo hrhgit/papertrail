@@ -87,6 +87,9 @@ def test_named_file_in_script_diff_is_an_edit(tmp_path):
         "cd x && claude -p 'edit notes.txt'",
         "git merge feature  # notes.txt",
         "git -C repo checkout main -- notes.txt",
+        "git --no-pager -C 'with spaces' restore notes.txt",
+        "/usr/bin/git --work-tree=project checkout-index -- notes.txt",
+        "codex<input.txt && ls notes.txt",
         "git stash pop && cat notes.txt",
     ],
 )
@@ -132,3 +135,121 @@ def test_new_file_and_unavailable_flag(tmp_path):
     (f,) = [f for f in histories([s]) if f.path.endswith("notes.txt")]
     owners = {h.id: h for h in f.hunks}
     assert [owners[o].kind for _, _, o in f.ranges] == ["agent"]
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git diff notes.txt",
+        "cat notes.txt",
+        "/bin/cat notes.txt",
+        "cd sub && grep -n old notes.txt | head -5",
+        "sed -n 1,5p notes.txt 2>&1",
+        "git -C repo log -p -- notes.txt > /dev/null",
+        "git --no-pager -C 'with spaces' diff -- notes.txt",
+        "rg -n old notes.txt",
+        "find . -name notes.txt",
+        "sort notes.txt",
+        "xxd notes.txt",
+    ],
+)
+def test_read_only_command_is_not_an_edit(tmp_path, command):
+    s, source = session(tmp_path, command, [notes(tmp_path)])
+    assert not [e for e in s.edits if e.tool == "Bash"]
+    assert source.skipped["bash_diff_read_only"] == 1
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "sed -i '' 's/old/new/' notes.txt",
+        "cat notes.txt > notes.txt.tmp; mv notes.txt.tmp notes.txt",
+        "sed -n 'w notes.txt' input.txt",
+        "sed -ni 'p' notes.txt",
+        "find . -name notes.txt -exec touch {} +",
+        "sort --output=notes.txt notes.txt",
+        "uniq input.txt notes.txt",
+        "xxd -r input.txt notes.txt",
+        "git diff --output=notes.txt",
+        "./cat notes.txt",
+    ],
+)
+def test_writing_commands_still_count(tmp_path, command):
+    s, _ = session(tmp_path, command, [notes(tmp_path)])
+    assert [e.tool for e in s.edits if e.tool == "Bash"] == ["Bash"]
+
+
+def test_dev_null_prefix_is_not_a_discarded_redirect(tmp_path):
+    entry = {"filePath": "/dev/null-dir/notes.txt", "hunks": [hunk(1, ["old"], ["new"])]}
+    s, _ = session(tmp_path, "cat input.txt >/dev/null-dir/notes.txt", [entry])
+    assert [e.path for e in s.edits if e.tool == "Bash"] == [entry["filePath"]]
+
+
+def test_quoted_agent_invocation_is_another_writer(tmp_path):
+    s, source = session(tmp_path, "bash -c 'claude -p fix' notes.txt", [notes(tmp_path)])
+    assert not [e for e in s.edits if e.tool == "Bash"]
+    assert source.skipped["bash_diff_other_writer"] == 1
+
+
+def test_literal_echo_of_agent_name_with_or_without_diff(tmp_path):
+    for files in ([], [notes(tmp_path)]):
+        s, source = session(tmp_path, "echo codex > notes.txt", files)
+        (edit,) = [e for e in s.edits if e.tool == "Bash"]
+        assert edit.after == "codex\n"
+        assert source.counts["bash_diff_edits"] == 0
+
+
+def test_name_inside_another_name_is_not_named(tmp_path):
+    entry = {"filePath": str(tmp_path / "a.py"), "hunks": [hunk(1, ["a"], ["b"])]}
+    s, source = session(tmp_path, "python3 fix.py data.py", [entry])
+    assert not [e for e in s.edits if e.tool == "Bash"]
+    assert source.skipped["bash_diff_unnamed_file"] == 1
+
+
+def test_same_filename_in_another_directory_is_not_named(tmp_path):
+    entry = {
+        "filePath": str(tmp_path / "docs" / "notes.txt"),
+        "hunks": [hunk(1, ["old"], ["new"])],
+    }
+    s, source = session(tmp_path, "python rewrite.py other/notes.txt", [entry])
+    assert not [e for e in s.edits if e.tool == "Bash"]
+    assert source.skipped["bash_diff_unnamed_file"] == 1
+    for target in ("docs/notes.txt", "./docs/notes.txt", entry["filePath"]):
+        s, _ = session(tmp_path, f"python rewrite.py '{target}'", [entry])
+        assert [e.path for e in s.edits if e.tool == "Bash"] == [entry["filePath"]]
+    for separator in (" && ", "; ", "\n"):
+        command = "cd docs" + separator + "python rewrite.py notes.txt"
+        s, _ = session(tmp_path, command, [entry, notes(tmp_path)])
+        assert [e.path for e in s.edits if e.tool == "Bash"] == [entry["filePath"]]
+
+
+def test_shared_result_record_is_ambiguous(tmp_path):
+    logs = tmp_path / "claude"
+    s, _ = session(tmp_path, SCRIPT, [notes(tmp_path)])
+    rows = [json.loads(x) for x in (logs / "cedar.jsonl").read_text().splitlines()]
+    use = rows[-2]["message"]["content"][0]
+    twin = dict(use, id=use["id"] + "b")
+    rows[-2]["message"]["content"].append(twin)
+    result = rows[-1]["message"]["content"][0]
+    rows[-1]["message"]["content"].append(dict(result, tool_use_id=twin["id"]))
+    (logs / "cedar.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    source = ClaudeCodeSource()
+    (s,) = source.sessions(logs)
+    assert not [e for e in s.edits if e.tool == "Bash"]
+    assert source.failures["ambiguous_shared_result"] >= 1
+
+
+@pytest.mark.parametrize("exit_code", [0, 1])
+def test_shared_payload_cannot_confirm_literal_shell_write(tmp_path, exit_code):
+    logs = tmp_path / "claude"
+    session(tmp_path, "cat > notes.txt <<'END'\nnew\nEND", [notes(tmp_path)])
+    path = logs / "cedar.jsonl"
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    result = rows[-1]["message"]["content"][0]
+    rows[-1]["message"]["content"].append(dict(result, tool_use_id="unrelated"))
+    rows[-1]["toolUseResult"]["exitCode"] = exit_code
+    path.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    source = ClaudeCodeSource()
+    (parsed,) = source.sessions(logs)
+    assert not [e for e in parsed.edits if e.tool == "Bash"]
+    assert source.failures["ambiguous_shared_result"] == 1

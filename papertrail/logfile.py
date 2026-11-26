@@ -91,6 +91,42 @@ class _Command(io.RawIOBase):
         super().close()
 
 
+class _PackageStream(io.RawIOBase):
+    """Read all frames, checking that input ends at a frame boundary."""
+
+    def __init__(self, path, zstandard):
+        self.raw = None
+        self.decompressor = zstandard.ZstdDecompressor()
+        self.frame = self.decompressor.decompressobj()
+        self.raw = path.open("rb")
+        self.pending = b""
+        self.decoded = memoryview(b"")
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        while not self.decoded:
+            data = self.pending or self.raw.read(io.DEFAULT_BUFFER_SIZE)
+            if not data:
+                if not self.frame.eof:
+                    raise EOFError("Compressed log ended before the end of a zstd frame")
+                return 0
+            if self.frame.eof:
+                self.frame = self.decompressor.decompressobj()
+            self.decoded = memoryview(self.frame.decompress(data))
+            self.pending = self.frame.unused_data
+        n = min(len(buffer), len(self.decoded))
+        buffer[:n] = self.decoded[:n]
+        self.decoded = self.decoded[n:]
+        return n
+
+    def close(self):
+        if not self.closed and self.raw is not None:
+            self.raw.close()
+        super().close()
+
+
 def open_log(path):
     """A binary stream of the log's JSONL text. Raises OSError when it can't be read,
     and ZstdUnavailable when the file is compressed and no decoder exists."""
@@ -100,12 +136,7 @@ def open_log(path):
     if zstd := _stdlib():
         return zstd.open(path, "rb")
     if zstandard := _package():
-        raw = path.open("rb")
-        try:
-            return io.BufferedReader(zstandard.ZstdDecompressor().stream_reader(raw, closefd=True))
-        except Exception:
-            raw.close()
-            raise
+        return io.BufferedReader(_PackageStream(path, zstandard))
     if shutil.which("zstd"):
         return io.BufferedReader(_Command(path))
     raise ZstdUnavailable(f"no zstd decoder for {path.name}")

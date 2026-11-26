@@ -51,6 +51,36 @@ def test_forms(tmp_path, header, op):
 
 
 @pytest.mark.parametrize(
+    ("command", "operation", "value"),
+    [
+        ("echo codex > one", "overwrite", "codex\n"),
+        ("echo 'literal $HOME' >> one", "append", "literal $HOME\n"),
+        ('echo "" > one', "overwrite", "\n"),
+    ],
+)
+def test_single_literal_echo(tmp_path, command, operation, value):
+    (edit,), _ = parse(command, tmp_path)
+    assert edit.path == str(tmp_path / "one")
+    assert edit.operation == operation
+    assert (edit.after or edit.appended) == value
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo '-n' > one",
+        'echo "$HOME" > one',
+        r"echo 'a\nb' > one",
+        "echo value | tee one",
+        "echo value > one; true",
+        "echo value > $target",
+    ],
+)
+def test_echo_without_literal_write_evidence(tmp_path, command):
+    assert not parse(command, tmp_path)[0]
+
+
+@pytest.mark.parametrize(
     ("cmd", "reason"),
     [
         ("cat > one <<D\n$HOME\nD", "body_expansion"),
@@ -164,8 +194,8 @@ def test_claude_write_and_codex_child_trace(tmp_path):
         assert q.trace(tmp_path / "story", 2)["rows"][0]["kind"] == "drift"
 
 
-def test_completion_event_and_receipt(tmp_path):
-    cmd = "cat > x <<D\nx\nD"
+@pytest.mark.parametrize("cmd", ["cat > x <<D\nx\nD", "echo x > x"])
+def test_completion_event_and_receipt(tmp_path, cmd):
     argv = json.dumps({"cmd": cmd})
     native = completed(
         "shell",
@@ -193,7 +223,63 @@ def test_completion_event_and_receipt(tmp_path):
         ],
     )
     (s,) = CodexSource().sessions(tmp_path)
-    assert len(s.edits) == 1
+    (edit,) = s.edits
+    assert edit.after == "x\n"
+
+
+def test_heredoc_guarded_by_literal_mkdir(tmp_path):
+    cmd = "mkdir -p 'new folder' && cat > 'new folder/x' <<'D'\nx\nD"
+    (edit,), _ = parse(cmd, tmp_path)
+    assert (edit.path, edit.after) == (str(tmp_path / "new folder/x"), "x\n")
+    assert not parse(cmd + "\ntrue", tmp_path)[0]
+    assert not parse(cmd.replace("'new folder'", '"$DIR"', 1), tmp_path)[0]
+    assert not parse(cmd, tmp_path, "failed")[0]
+
+
+@pytest.mark.parametrize(
+    ("changes", "competing", "retained"),
+    [
+        ({}, False, True),
+        ({"exit_code": 1}, False, False),
+        ({"exit_code": False}, False, False),
+        ({"status": "failed"}, False, False),
+        ({"source": "user"}, False, False),
+        ({"plugin_id": "fiction"}, False, False),
+        ({"command": ["/usr/bin/python", "-c", "cat > x <<D\nx\nD"]}, False, False),
+        ({"command": ["/tmp/bash", "-c", "cat > x <<D\nx\nD"]}, False, False),
+        ({"command": ["/bin/sh", "-c", "cat > x <<D\nx\nD\ntrue"]}, False, False),
+        ({"cwd": "relative"}, False, False),
+        ({}, True, False),
+    ],
+)
+def test_runtime_command_proves_one_resolved_literal_write(tmp_path, changes, competing, retained):
+    attrs = {
+        "type": "CommandExecution",
+        "source": "unified_exec_startup",
+        "cwd": str(tmp_path),
+        "command": ["/bin/sh", "-c", "cat > x <<D\nx\nD"],
+        "status": "completed",
+        "exit_code": 0,
+    }
+    attrs.update(changes)
+    rows = [
+        call("wrapper", "text(await tools.exec_command({cmd: getCommand()}))", "exec"),
+        completed("inner", **attrs),
+    ]
+    if competing:
+        rows.append(completed("competing", **(attrs | {"plugin_id": "fiction"})))
+    rows.append(output("wrapper", "Script completed\nOutput:\n{}"))
+    rollout(tmp_path, "resolved", rows)
+    source = CodexSource()
+    (s,) = source.sessions(tmp_path)
+    assert source.counts["runtime_literal_edits"] == int(retained)
+    if retained:
+        (edit,) = s.edits
+        assert (edit.path, edit.after, edit.prompt) == (
+            str(tmp_path / "x"), "x\n", s.prompts[0].id,
+        )
+    else:
+        assert not s.edits
 
 
 def test_event_directory_is_local_file_url(tmp_path):
@@ -209,6 +295,20 @@ def test_event_directory_is_local_file_url(tmp_path):
     rollout(tmp_path, "uri", [native])
     (s,) = CodexSource().sessions(tmp_path)
     assert s.edits[0].path == str(tmp_path / "a b/new")
+
+
+def test_non_shell_event_argument_is_not_a_command(tmp_path):
+    native = completed(
+        "printed",
+        type="CommandExecution",
+        cwd=str(tmp_path),
+        command=["/bin/echo", "-c", "cat > x <<D\nx\nD"],
+        status="completed",
+        exit_code=0,
+    )
+    rollout(tmp_path, "echo-argv", [native])
+    (s,) = CodexSource().sessions(tmp_path)
+    assert not s.edits
 
 
 def test_two_heredocs_on_one_header(tmp_path):
