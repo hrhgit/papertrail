@@ -96,3 +96,36 @@ def test_unknown_without_candidate_stays_unknown(tmp_path):
     assert f.unplaced_edits == {"unplaced"}
     (h,) = f.hunks
     assert (h.kind, h.text, h.edit) == ("unknown", "", None)
+
+
+def test_short_name_from_another_directory_is_not_a_hint(tmp_path):
+    path = tmp_path / "project" / "README.md"
+    path.parent.mkdir()
+    path.write_text("prior\ndisk\n")
+    edit = Edit("edit", 0, ts(5), "Edit", str(path), None, "demo",
+                before="prior\noriginal\n", after="prior\nrecorded\n")
+    elsewhere = Hint("elsewhere", 0, ts(7), "Bash", str(tmp_path / "other"),
+                     "python3 tidy.py README.md", None, "demo", "")
+    inside = Hint("inside", 0, ts(6), "Bash", str(path.parent),
+                  "python3 tidy.py README.md", None, "demo", "")
+    session = Session("writer", "claude-code", "", edits=[edit], hints=[inside, elsewhere])
+    (f,) = histories([session])
+    current = next(h for h in f.hunks if h.kind == "inferred")
+    assert (current.basis, current.inferred_from) == ("command", "inside")
+    other = Session("other", "codex", "", hints=[elsewhere])
+    assert [s.id for s in select([session, other], tmp_path / "project")] == ["writer"]
+
+
+def test_unknown_lines_never_take_a_later_command(tmp_path):
+    from papertrail.replay import FileHistory, Hunk, infer, order
+
+    path = str(tmp_path / "example.txt")
+    commands = [
+        Hint(key, 0, ts(second), "Bash", str(tmp_path), "python3 rewrite.py example.txt",
+             None, "demo", "")
+        for key, second in [("before", 3), ("later", 9)]
+    ]
+    seen = Hint("seen", 0, ts(5), "Read", "", "", None, "", "")
+    f = FileHistory(path, hunks=[Hunk(path + "#0", "unknown", "", 1, 0, "", {}, None)])
+    infer(f, commands, [order(h) for h in commands], {path + "#0": (None, order(seen))}, None)
+    assert (f.hunks[0].kind, f.hunks[0].inferred_from) == ("inferred", "before")

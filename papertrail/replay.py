@@ -725,7 +725,12 @@ def hint_names(hint, path):
     if Path(path).name not in hint.command:
         return False
     cwd = command_cwd(hint.command, hint.cwd)
-    return names_exactly(hint.command, path, cwd) or tail_name(hint.command, path) is not None
+    if names_exactly(hint.command, path, cwd):
+        return True
+    # A short name only identifies a file inside the directory the command ran in;
+    # `README.md` from another project's session is not this file.
+    roots = [Path(d) for d in (hint.cwd, cwd) if d]
+    return any(Path(path).is_relative_to(r) for r in roots) and tail_name(hint.command, path) is not None
 
 
 def infer(file, hints, hint_keys, windows, last_observed):
@@ -741,7 +746,7 @@ def infer(file, hints, hint_keys, windows, last_observed):
         lo = bisect_right(hint_keys, previous) if previous is not None else 0
         hi = (
             bisect_left(hint_keys, observed)
-            if observed is not None and h.kind != "unknown"
+            if observed is not None
             else len(hints)
         )
         for i in range(hi - 1, lo - 1, -1):
