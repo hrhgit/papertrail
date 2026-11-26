@@ -15,6 +15,7 @@ import re
 from bisect import bisect_right
 from pathlib import Path
 
+from .logfile import current, open_log
 from .sources.claude import result_text, unified, user_text
 from .sources.codex import human, output_status, payload_text
 from .sources.codex_patch import wrapper_patch
@@ -193,7 +194,7 @@ def conversation_version(session):
     path = session.get("log_path")
     if not path:
         return None
-    path = Path(path)
+    path = current(path)
     try:
         main = stamp(path.stat())
         if session.get("agent") == "codex":
@@ -413,7 +414,7 @@ def codex_items(log_path, sid):
     started = None
     seq = -1
     turn = ""
-    with open(log_path, "rb") as stream:
+    with open_log(log_path) as stream:
         for line in stream:
             try:
                 record = json.loads(line)
@@ -525,6 +526,8 @@ def written_diff(edits, hunks):
 def conversation(session, edits):
     """Items for the page, or a note saying why the log can't be read."""
     path = session.get("log_path") or ""
+    if path:
+        path = str(current(path))
     if not path or not Path(path).is_file():
         return {"items": [], "note": "The log for this session is no longer on disk."}
     try:
@@ -532,7 +535,9 @@ def conversation(session, edits):
             steps = codex_items(path, session["id"])
         else:
             steps = claude_items(path, session["id"], Path(path).parent.name == "subagents")
-    except OSError:
+    except Exception as error:  # OSError, or a zstd decoder's own error
+        if not isinstance(error, OSError) and not path.endswith(".zst"):
+            raise
         return {"items": [], "note": "The log for this session could not be read."}
     attach(steps, edits)
     note = f"Only the first {MAX_STEPS:,} steps are shown." if steps.dropped else None

@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
+from ..logfile import ZstdUnavailable, compressed, log_stem, open_log
 from ..model import Edit, Prompt, Session
 from .codex_patch import (
     absolute,
@@ -722,20 +723,27 @@ class CodexSource:
 
     def raw_lines(self, path):
         # Rollouts are append-only. Use the same byte boundary in the metadata
-        # pass, the parsing pass and the independent receipt audit.
-        remaining = self.log_sizes[path]
+        # pass, the parsing pass and the independent receipt audit. A compressed
+        # rollout is finished, so it is read to the end, and progress counts it
+        # when it is done rather than by decompressed bytes.
+        packed = compressed(path)
+        remaining = -1 if packed else self.log_sizes[path]
         unreported = 0
         try:
-            with path.open("rb") as stream:
+            with open_log(path) as stream:
                 while remaining and (line := stream.readline(remaining)):
-                    remaining -= len(line)
-                    if self.tick:
+                    remaining -= len(line) if remaining > 0 else 0
+                    if self.tick and not packed:
                         unreported += len(line)
                         if unreported >= READ_CHUNK:
                             self.tick(path, unreported)
                             unreported = 0
                     yield line
-        except OSError:
+        except ZstdUnavailable:
+            self.failures["compressed_rollout_without_zstd"] += 1
+        except Exception as error:  # OSError, or a decoder's own error type
+            if not packed and not isinstance(error, OSError):
+                raise
             self.failures["unreadable_rollout"] += 1
 
     def records(self, path):
@@ -766,7 +774,8 @@ class CodexSource:
         yield from sorted(unique.values(), key=lambda r: r.get("timestamp", ""))
 
     def log_files(self, root):
-        return sorted(Path(root).expanduser().resolve().rglob("rollout-*.jsonl"))
+        root = Path(root).expanduser().resolve()
+        return sorted([*root.rglob("rollout-*.jsonl"), *root.rglob("rollout-*.jsonl.zst")])
 
     def sessions(self, root, progress=None):
         batch, child_paths, launches = {}, {}, defaultdict(list)
@@ -788,7 +797,7 @@ class CodexSource:
         # Count bytes only in the full pass, not the metadata pass above.
         self.tick = progress
         for sid, paths in groups.items():
-            paths.sort(key=lambda p: not p.stem.endswith(sid))
+            paths.sort(key=lambda p: (not log_stem(p).endswith(sid), compressed(p)))
             self.counts["replica_files"] += len(paths) - 1
             run = None
             for seq, r in enumerate(self.merged(paths)):

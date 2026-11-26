@@ -13,6 +13,27 @@ from .shell_write import shell_edits, shell_status
 # Report bytes read within a large log this often, so progress keeps moving.
 READ_CHUNK = 1 << 22
 
+# A Bash result's `bashEditDiff` lists what the command changed on disk. It is not
+# this session's writing when the command ran another agent (that agent's own log
+# records the edit) or moved existing content in with git.
+OTHER_AGENT = re.compile(
+    r"(?:^|[\s;&|(`/])(?:codex|claude|kimi|dsh|aider|gemini|cursor-agent|opencode"
+    r"|ai_run\.py|codex_app\.py)(?=$|[\s;&|)`'\"])"
+)
+GIT_CONTENT = re.compile(
+    r"\bgit\s+(?:-[Cc]\s+\S+\s+)*(?:checkout|switch|merge|pull|rebase|stash|reset|restore"
+    r"|cherry-pick|revert|am|apply|clone|worktree)\b"
+)
+
+
+def hunk_counts_match(hunk):
+    rows = hunk.get("lines")
+    if not isinstance(rows, list) or not all(isinstance(r, str) for r in rows):
+        return False
+    old = sum(not r.startswith("+") and not r.startswith("\\") for r in rows)
+    new = sum(not r.startswith("-") and not r.startswith("\\") for r in rows)
+    return (old, new) == (hunk.get("oldLines"), hunk.get("newLines"))
+
 
 def timestamp(value):
     return datetime.fromisoformat(value).astimezone(UTC).isoformat()
@@ -354,6 +375,12 @@ class ClaudeCodeSource:
                                 for edit in edits:
                                     self.retain_edit(session, edit, child_copy, native)
                                 continue
+                            if status == "success" and isinstance(payload, dict):
+                                edits = self.bash_diff_edits(session, call, payload, ts)
+                                if edits:
+                                    for edit in edits:
+                                        self.retain_edit(session, edit, child_copy, native)
+                                    continue
                         if block.get("is_error"):
                             self.skipped["failed_" + ("read" if call[1] == "Read" else "tool")] += 1
                             continue
@@ -395,6 +422,60 @@ class ClaudeCodeSource:
                 self.failures["invalid_title"] += 1
         session.title = session.title or slug
         return session
+
+    def bash_diff_edits(self, session, call, result, ts):
+        """Edits from the diff Claude Code records for a Bash command. A file counts
+        only when the command names it, and the command neither runs another agent nor
+        brings content in with git. Each hunk is a numbered patch, so replay checks
+        its context against what the file held at that point."""
+        seq, _, args, prompt, model, tool_id, cwd, *rest = call
+        diff = result.get("bashEditDiff")
+        if not isinstance(diff, dict) or not isinstance(diff.get("files"), list):
+            return []
+        command = args.get("command") if isinstance(args.get("command"), str) else ""
+        if OTHER_AGENT.search(command) or GIT_CONTENT.search(command):
+            self.skipped["bash_diff_other_writer"] += len(diff["files"])
+            return []
+        edits = []
+        for i, entry in enumerate(diff["files"]):
+            filename = entry.get("filePath") if isinstance(entry, dict) else None
+            hunks = entry.get("hunks") if isinstance(entry, dict) else None
+            if not isinstance(filename, str) or not filename or not isinstance(hunks, list):
+                self.failures["incomplete_bash_diff"] += 1
+                continue
+            path = Path(filename).expanduser()
+            if not path.is_absolute():
+                if not cwd:
+                    self.failures["relative_path_without_cwd"] += 1
+                    continue
+                path = Path(cwd) / path
+            if path.name not in command:
+                self.skipped["bash_diff_unnamed_file"] += 1
+                continue
+            if not hunks or not all(isinstance(h, dict) and hunk_counts_match(h) for h in hunks):
+                self.skipped["bash_diff_incomplete_hunks"] += 1
+                continue
+            try:
+                patch = unified(hunks)
+            except (KeyError, TypeError):
+                self.failures["incomplete_bash_diff"] += 1
+                continue
+            edits.append(
+                Edit(
+                    f"{session.id}:e:{tool_id}:d{i}",
+                    seq,
+                    ts,
+                    "Bash",
+                    str(path.resolve()),
+                    prompt,
+                    model or session.model,
+                    patch=patch,
+                    effort=rest[0] if rest else "",
+                    call_id=tool_id,
+                )
+            )
+        self.counts["bash_diff_edits"] += len(edits)
+        return edits
 
     def edit(self, session, ts, call, result, text=""):
         seq, name, args, prompt, model, tool_id, cwd, *rest = call

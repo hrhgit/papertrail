@@ -8,6 +8,7 @@ trigger them. The same goes for showing the system folder dialog.
 """
 
 import codecs
+import io
 import json
 import os
 import re
@@ -33,6 +34,7 @@ from urllib.parse import parse_qs, urlparse
 import relate
 
 from .graph import build, portable_root, select
+from .logfile import open_log
 from .queries import Queries, file_version
 from .sources import DEFAULT_LOGS, SOURCES, ReadProgress, load_sources
 from .transcript import conversation, conversation_version, written_diff
@@ -1146,7 +1148,7 @@ def browse(path):
 def first_cwd(path, limit=200):
     """The working directory recorded near the top of one log file."""
     try:
-        with open(path, encoding="utf-8", errors="replace") as handle:
+        with io.TextIOWrapper(open_log(path), encoding="utf-8", errors="replace") as handle:
             for _, line in zip(range(limit), handle):
                 try:
                     record = json.loads(line)
@@ -1158,7 +1160,7 @@ def first_cwd(path, limit=200):
                 cwd = record.get("cwd") or (payload.get("cwd") if isinstance(payload, dict) else None)
                 if isinstance(cwd, str) and cwd.startswith("/"):
                     return cwd
-    except OSError:
+    except Exception:  # unreadable, or a compressed log this machine can't decode
         pass
     return None
 
@@ -1181,7 +1183,11 @@ def agent_folders(home=None, limit=40):
                 note(first_cwd(logs[0]), logs[0].stat().st_mtime)
     codex = home / DEFAULT_LOGS["codex"]
     if codex.is_dir():
-        logs = sorted(codex.rglob("rollout-*.jsonl"), reverse=True)[:3000]
+        logs = sorted(
+            [*codex.rglob("rollout-*.jsonl"), *codex.rglob("rollout-*.jsonl.zst")],
+            key=lambda p: p.name,
+            reverse=True,
+        )[:3000]
         for log in logs:
             note(first_cwd(log, limit=5), log.stat().st_mtime)
     rows = []
