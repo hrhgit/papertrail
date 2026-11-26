@@ -514,7 +514,7 @@ function updateFoldButton() {
   filesView.fold.hidden = !view.tree.dirs.length && !view.tree.files.length;
 }
 
-function fileRow(e, depth, label = base(e.path), only = null) {
+function fileRow(e, depth, label = base(e.path), only = null, share = null) {
   const f = e.graph;
   const gone = f?.status === "missing" ? "deleted" : f?.status === "unreadable" ? "unreadable" : null;
   const by = f?.edits
@@ -535,7 +535,7 @@ function fileRow(e, depth, label = base(e.path), only = null) {
       onclick: () => openFile(e.path),
     },
     h("span", { class: "name" }, label, gone ? h("span", { class: "tag" }, gone) : null),
-    f?.lines ? authorShare(f, only) : null,
+    share || (f?.lines ? authorShare(f, only) : null),
   );
 }
 
@@ -544,16 +544,14 @@ const byStart = (ids) =>
 
 // The file from top (left) to bottom (right), with each session's current
 // lines painted in its color where they sit; the rest stays grey.
-function authorShare(f, only = null) {
+function authorSpans(f, only = null) {
   const total = Math.max(f.lines || 0, ...(f.authors || []).map((a) => a[2]), 1);
-  return h(
-    "span",
-    { class: "share authors" },
-    (f.authors || []).filter(([id]) => !only || id === only).map(([id, start, end]) =>
-      h("i", { style: `left:${((start - 1) / total) * 100}%;width:${((end - start + 1) / total) * 100}%;background:${color(id)}` }),
-    ),
+  return (f.authors || []).filter(([id]) => !only || id === only).map(([id, start, end]) =>
+    h("i", { style: `left:${((start - 1) / total) * 100}%;width:${((end - start + 1) / total) * 100}%;background:${color(id)}` }),
   );
 }
+
+const authorShare = (f, only = null) => h("span", { class: "share authors" }, authorSpans(f, only));
 
 function setTreeFolder(view, folder, open) {
   if (folder.branch.hidden === !open) return;
@@ -616,7 +614,8 @@ function showFileTree() {
   const only = state.agentOnly;
   // Focusing a session narrows the tree to the files it edited.
   const focus = state.focus && state.sessions.has(state.focus) ? state.focus : null;
-  if (filesView.focus !== focus) focusFolded.clear();
+  const refocused = filesView.focus !== focus;
+  if (refocused) focusFolded.clear();
   filesView.focus = focus;
   const key = focus ? `focus:${focus}` : only;
   let view = views.get(key);
@@ -650,10 +649,14 @@ function showFileTree() {
   // Files outside the folder follow the same narrowing.
   let outside = 0;
   for (const [path, row] of filesView.awayRows) {
-    row.hidden = !!focus && !touchedBy(filesView.awayEntries.get(path), focus);
+    const entry = filesView.awayEntries.get(path);
+    row.hidden = !!focus && !touchedBy(entry, focus);
     if (!row.hidden) outside++;
+    const share = filesView.awayShares.get(path);
+    if (refocused && share) share.replaceChildren(...authorSpans(entry.graph, focus));
   }
   if (filesView.away) filesView.away.hidden = !outside;
+  if (filesView.awayCount) filesView.awayCount.textContent = outside;
   updateFoldButton();
   markFileRow();
 }
@@ -668,15 +671,22 @@ function renderFiles() {
   if (filesView?.entries !== state.entries || filesView.root !== state.root) {
     const here = [], away = [];
     for (const entry of state.entries) (inRoot(entry.path) ? here : away).push(entry);
-    const awayRows = new Map(away.map((entry) => [entry.path, fileRow(entry, 0, rel(entry.path))]));
+    // These rows are built once, so their bars are kept to repaint on focus.
+    const awayShares = new Map();
+    const awayRows = new Map(away.map((entry) => {
+      const share = entry.graph?.lines ? authorShare(entry.graph) : null;
+      if (share) awayShares.set(entry.path, share);
+      return [entry.path, fileRow(entry, 0, rel(entry.path), null, share)];
+    }));
+    const awayCount = h("span", { class: "count" }, awayRows.size);
     const outside = awayRows.size ? h(
       "details",
       { class: "past", open: awayRows.has(state.file?.path) },
-      h("summary", { title: "Edited by the same sessions" }, "Outside this folder", h("span", { class: "count" }, awayRows.size)),
+      h("summary", { title: "Edited by the same sessions" }, "Outside this folder", awayCount),
     ) : null;
     if (outside) for (const row of awayRows.values()) outside.append(row);
     filesView = {
-      here, awayRows, awayEntries: new Map(away.map((entry) => [entry.path, entry])), away: outside, views: new Map(), active: null,
+      here, awayRows, awayShares, awayCount, awayEntries: new Map(away.map((entry) => [entry.path, entry])), away: outside, views: new Map(), active: null,
       entries: state.entries, root: state.root, body: h("div"),
     };
   }
@@ -1680,6 +1690,9 @@ function clearFile() {
   $("gaps-toggle").hidden = true;
   $("file-title").textContent = base(state.root.replace(/\/$/, ""));
   $("file-note").hidden = true;
+  // The tag sits in the status bar, which outlives the file it spoke of.
+  $("stale-tag").hidden = true;
+  $("stale-tag").title = "";
   $("hover").replaceChildren();
   $("status-line").replaceChildren();
   $("lines").replaceChildren();
@@ -3744,11 +3757,15 @@ function fileMix() {
   for (const range of f?.tracks || []) {
     if (range.start > n) break;
     if (range.kind !== "agent") continue;
-    const id = laneIds(range)[0];
+    // Every session that wrote the spot, as the editor counts them: a focused
+    // session lights its lines here too when a later one wrote over them.
+    const ids = laneIds(range);
+    const id = ids.includes(state.focus) ? state.focus : ids[0];
+    const lit = !state.focus || id === state.focus;
     const end = Math.min(range.end, n);
     const last = runs.at(-1);
     if (last && last.id === id && last.end + 1 === range.start) last.end = end;
-    else runs.push({ id, start: range.start, end });
+    else runs.push({ id, lit, start: range.start, end });
   }
   if (!runs.length) return [];
   const go = (line) => scrollToFileRow(Math.max(0, Math.min(n, line) - 1));
@@ -3764,7 +3781,7 @@ function fileMix() {
       },
       runs.map((run) =>
         h("i", {
-          class: `mix-part${state.focus && state.focus !== run.id ? " off" : ""}`,
+          class: run.lit ? "mix-part" : "mix-part off",
           style: `left:${((run.start - 1) / n) * 100}%;width:${((run.end - run.start + 1) / n) * 100}%;background:${color(run.id)}`,
           title: `${sessionLabel(run.id)} · ${run.start === run.end ? `Ln ${run.start}` : `Ln ${run.start}–${run.end}`}`,
           onclick: (e) => {
