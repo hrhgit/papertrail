@@ -2631,16 +2631,14 @@ function historyChips(gap, titled = false) {
     if (at >= 0 && at < run.idx.length) showStop(run.idx[at]);
   };
   const face = h("summary", { class: "hpick-face", id: "hpick-face", "aria-label": label });
-  // The list names the agent sessions; changes made outside them only get counted.
+  // The list names the agent sessions only; changes made outside them are left out.
   const agents = runs.filter((run) => !runParts(run).kind);
-  const outside = t.stops.length - agents.reduce((n, run) => n + run.idx.length, 0);
   const list = h(
     "ol",
     { class: "hpick-list", role: "listbox", "aria-label": label },
     agents.map((run) => h("li", {}, historyRow(run))),
-    outside ? h("li", { class: "hpick-note" }, `${plural(outside, "change")} outside the agents`) : null,
   );
-  t.single = !(agents.length > 1 || (agents.length && outside));
+  t.single = agents.length < 2;
   const pick = h("details", { class: t.single ? "hpick single" : "hpick", id: "hpick", ontoggle: (e) => e.target.open && closeOnOutside(e.target) }, face, list);
   const arrows = h(
     "span",

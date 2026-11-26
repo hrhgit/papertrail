@@ -81,6 +81,12 @@ FILE_SESSIONS = """
 MATCH (s:Session)-[:HAS_EDIT]->(e:Edit)-[:TOUCHED]->(f:File)
 RETURN f.path AS path, s.id AS id, count(e) AS edits ORDER BY path, id"""
 
+# A move only touches where the file went; this is where it came from.
+FILE_MOVES = """
+MATCH (s:Session)-[:HAS_EDIT]->(e:Edit)
+WHERE e.moved_from IS NOT NULL
+RETURN e.moved_from AS path, s.id AS id ORDER BY path, id"""
+
 SESSIONS = """
 MATCH (s:Session)
 OPTIONAL MATCH (s)-[:HAS_EDIT]->(e:Edit)
@@ -498,12 +504,16 @@ class ReaderQueries(Queries):
                 spans[-1][2] = max(spans[-1][2], row["end"])
             else:
                 spans.append([row["id"], row["start"], row["end"]])
+        # A session belongs to a file it edited, moved away, or still has lines
+        # in: lines follow a file through a move another session made.
         touched = {}
-        for row in self._run(FILE_SESSIONS):
-            touched.setdefault(row["path"], []).append(row["id"])
+        for row in self._run(FILE_SESSIONS) + self._run(FILE_MOVES):
+            touched.setdefault(row["path"], set()).add(row["id"])
+        for path, spans in authors.items():
+            touched.setdefault(path, set()).update(span[0] for span in spans)
         for row in files:
             row["authors"] = authors.get(row["path"], [])
-            row["touched"] = touched.get(row["path"], [])
+            row["touched"] = sorted(touched.get(row["path"], ()))
         sessions = self._overview_sessions()
         written = {row["id"]: row["written"] for row in self._run(WRITTEN)}
         alive = {row["id"]: row["alive"] for row in self._run(ALIVE)}

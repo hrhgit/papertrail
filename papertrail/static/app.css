@@ -877,7 +877,6 @@ button.link { border: 0; background: none; padding: 0; text-decoration: underlin
 .hrow-n { justify-self: end; min-width: 18px; padding: 0 5px; border-radius: 999px; background: var(--hover); color: var(--muted); font-size: 11px; line-height: 16px; text-align: center; font-variant-numeric: tabular-nums; }
 .hrow-n:empty { visibility: hidden; }
 .hrow[aria-selected="true"] .hrow-n { background: var(--paper); }
-.hpick-note { padding: 6px 8px 3px; margin-top: 3px; border-top: 1px solid var(--rule); color: var(--muted); font-size: 11.5px; }
 
 /* The file as one bar, top to bottom, shown in the hover row while nothing is hovered. */
 .mix { position: relative; flex: 1; min-width: 0; height: 6px; background: var(--rule); border-radius: 3px; overflow: hidden; cursor: pointer; }
