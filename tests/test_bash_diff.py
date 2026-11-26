@@ -29,14 +29,14 @@ def hunk(old_start, old, new, context=()):
     }
 
 
-def session(tmp_path, command, files, error=False, extra=None):
+def session(tmp_path, command, files, error=False, extra=None, receipt=None, **options):
     logs = tmp_path / "claude"
     logs.mkdir(exist_ok=True)
     rows = [json.loads(x) for x in FAKE.read_text().splitlines()]
     for r in rows:
         if "cwd" in r:
             r["cwd"] = str(tmp_path)
-    rows[-2]["message"]["content"][0].update(name="Bash", input={"command": command})
+    rows[-2]["message"]["content"][0].update(name="Bash", input={"command": command, **options})
     result = rows[-1]["message"]["content"][0]
     if error:
         result["is_error"] = True
@@ -47,6 +47,7 @@ def session(tmp_path, command, files, error=False, extra=None):
         "stderr": "",
         "exitCode": 1 if error else 0,
         "bashEditDiff": diff,
+        **(receipt or {}),
     }
     (logs / "cedar.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
     source = ClaudeCodeSource()
@@ -70,13 +71,40 @@ def test_named_file_in_script_diff_is_an_edit(tmp_path):
     owners = {h.id: h for h in f.hunks}
     kinds = [owners[o].kind for _, _, o in f.ranges]
     # Line 1 is context the diff showed, line 2 the command's write, line 3 never seen.
-    assert kinds == ["baseline", "agent", "unknown"]
+    assert kinds == ["baseline", "agent", "inferred"]
+    assert (owners[f.ranges[-1][2]].basis, owners[f.ranges[-1][2]].was) == ("nearby", "unknown")
+    assert source.counts["write_hints"] == 0
     store = tmp_path / "graph.rl"
     build(store, [s])
     with Queries(store) as q:
         row = q.trace(tmp_path / "notes.txt", 2)["rows"][0]
         assert (row["agent"], row["tool"], row["session"]) == ("claude-code", "Bash", "cedar")
         assert row["prompt"] == "Use a morning greeting and keep the local note."
+
+
+def test_successful_script_without_diff_emits_a_hint(tmp_path):
+    s, source = session(tmp_path, SCRIPT, [], receipt={"bashEditDiff": None})
+    (hint,) = s.hints
+    assert (hint.command, hint.cwd, hint.tool) == (SCRIPT, str(tmp_path), "Bash")
+    assert hint.prompt in {p.id for p in s.prompts}
+    assert hint.model
+    assert source.counts["write_hints"] == 1
+
+
+@pytest.mark.parametrize(
+    "command,receipt,options",
+    [
+        ("cat notes.txt", {}, {}),
+        ("codex exec 'update notes.txt'", {}, {}),
+        ("git restore notes.txt", {}, {}),
+        (SCRIPT, {"exitCode": 1}, {}),
+        (SCRIPT, {"interrupted": True}, {}),
+        (SCRIPT, {}, {"run_in_background": True}),
+    ],
+)
+def test_write_hint_requires_successful_agent_command(tmp_path, command, receipt, options):
+    s, source = session(tmp_path, command, [], receipt=receipt, **options)
+    assert not s.hints and source.counts["write_hints"] == 0
 
 
 @pytest.mark.parametrize(

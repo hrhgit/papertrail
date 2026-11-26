@@ -73,10 +73,10 @@ def test_attribution(sessions):
     files = {Path(f.path).name: f for f in histories(sessions)}
     f = files["greeting.py"]
     lookup = {h.id: h for h in f.hunks}
-    assert [(a, b, lookup[h].kind) for a, b, h in f.ranges] == [
-        (1, 1, "drift"),
-        (2, 2, "agent"),
-        (3, 3, "external"),
+    assert [(a, b, lookup[h].kind, lookup[h].was) for a, b, h in f.ranges] == [
+        (1, 1, "inferred", "drift"),
+        (2, 2, "agent", ""),
+        (3, 3, "inferred", "external"),
     ]
     assert f.external_events == 1
     assert "00:00:07" < lookup[f.ranges[2][2]].ts.split("T")[1] < "00:00:23"
@@ -151,10 +151,12 @@ def test_graph_and_queries(store):
         assert rows[-1]["prompt"] == "Start with a simple greeting."
         assert rows[-1]["resume"] == "claude --resume amber"
         pseudo = q.trace(GREETING, 1)["rows"][0]
-        assert pseudo["session"] is None and pseudo["next_files"] == pseudo["previous_files"] == []
+        assert (pseudo["session"], pseudo["kind"], pseudo["basis"], pseudo["was"]) == (
+            "cedar", "inferred", "nearby", "drift",
+        )
         assert q.trace(PROJECT / "usage.txt", 1)["rows"][0]["resume"] == "claude --resume amber"
         assert q.trace(PROJECT / "usage.txt", 1)["rows"][0]["prompt"] == rows[2]["prompt"]
-        assert [r["kind"] for r in q.blame(GREETING, 2, 3)["rows"]] == ["agent", "external"]
+        assert [r["kind"] for r in q.blame(GREETING, 2, 3)["rows"]] == ["agent", "inferred"]
         assert q.blame(GREETING, limit=1)["truncated"]
         (c,) = q.crossings()["rows"]
         assert c["session_count"] == 3 and c["start"] == c["end"] == 2
@@ -166,8 +168,9 @@ def test_graph_and_queries(store):
         ]
         assert q.stats()["rows"][0]["lines"] == {
             "agent": 3,
-            "drift": 1,
-            "external": 1,
+            "inferred": 2,
+            "drift": 0,
+            "external": 0,
             "baseline": 1,
             "unknown": 0,
         }
@@ -454,6 +457,7 @@ def test_cli_text_and_stale(tmp_path, sessions):
     assert shown.returncode == 0 and not shown.stderr
     assert '      2 │ greeting = "morning"' in shown.stdout
     assert "cedar  Morning greeting\n          Use a morning greeting" in shown.stdout
+    assert "Likely claude-code (nearest recorded edit)" in shown.stdout
     assert all(len(line) <= 100 for line in shown.stdout.splitlines())
     traced = text("trace", f"{file}:2", "--store", store)
     assert "Asked     Use a morning greeting" in traced.stdout and "claude --resume cedar" in traced.stdout

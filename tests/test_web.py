@@ -74,7 +74,8 @@ def test_tracks_show_every_session_crossing_a_line(store):
     assert by_start[2]["kind"] == "agent"
     assert [lane["session"] for lane in by_start[2]["lanes"]][:3] == ["cedar", "birch", "amber"]
     assert by_start[2]["lanes"][0]["depth"] == 0
-    assert by_start[1]["kind"] == "drift" and by_start[3]["kind"] == "external"
+    assert (by_start[1]["kind"], by_start[1]["was"]) == ("inferred", "drift")
+    assert (by_start[3]["kind"], by_start[3]["was"]) == ("inferred", "external")
     assert any("-[:REPLACED]->" in c for c in view["cypher"])
 
 
@@ -684,7 +685,7 @@ def test_session_line_fates_account_for_every_written_line(tmp_path):
     assert touched[str(deleted)] == ["first", "other"]
     assert {row["path"]: row["lines"] for row in conv["alive_in"]} == {str(main): 2, str(moved): 1}
     assert {(r["session"], r["kind"]): r["lines"] for r in conv["replaced"]} == {
-        ("first", "agent"): 1, ("other", "agent"): 4, (None, "external"): 1, (None, "drift"): 1,
+        ("first", "agent"): 1, ("other", "agent"): 4, (None, "inferred"): 2,
     }
     assert {r["kind"]: r["lines"] for r in conv["unaccounted"]} == {
         "missing": 2, "unreadable": 3, "unknown": 1,
@@ -696,13 +697,13 @@ def test_span_lists_each_instruction_behind_a_run_of_lines(store, server):
     with ReaderQueries(store) as q:
         rows = q.span(GREETING, 1, 3)["rows"]
         # Newest first; only the stops at depth 0 still own lines in the span.
-        assert [(r["kind"], r["session"], r["lines"]) for r in rows] == [
-            ("agent", "cedar", 1),
-            ("agent", "birch", 0),
-            ("external", None, 1),
-            ("agent", "amber", 0),
-            ("agent", "amber", 0),
-            ("drift", None, 1),
+        assert [(r["kind"], r["was"], r["session"], r["lines"]) for r in rows] == [
+            ("agent", None, "cedar", 1),
+            ("agent", None, "birch", 0),
+            ("inferred", "external", "amber", 1),
+            ("agent", None, "amber", 0),
+            ("agent", None, "amber", 0),
+            ("inferred", "drift", "cedar", 1),
         ]
         assert rows[0]["prompt"].startswith("Use a morning greeting") and rows[0]["edits"] == 1
         assert q.span(GREETING, 2, 99)["end"] == 3

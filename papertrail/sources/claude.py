@@ -8,7 +8,7 @@ from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
 
-from ..model import Edit, Prompt, Read, Replacement, Session
+from ..model import Edit, Hint, Prompt, Read, Replacement, Session
 from .shell_write import DOC, WORD, literal_path, shell_edits, shell_status
 
 # Report bytes read within a large log this often, so progress keeps moving.
@@ -351,8 +351,8 @@ class ClaudeCodeSource:
                 visited.add(node)
                 node, prompt = parents[node]
             if prompt:
-                for edit in session.edits:
-                    edit.prompt = edit.prompt or prompt
+                for record in (*session.edits, *session.hints):
+                    record.prompt = record.prompt or prompt
             yield session
 
     def retain_edit(self, session, edit, child_copy, native):
@@ -534,6 +534,21 @@ class ClaudeCodeSource:
                                     for edit in edits:
                                         self.retain_edit(session, edit, child_copy, native)
                                     continue
+                            command = args.get("command")
+                            if (
+                                status == "success"
+                                and isinstance(command, str)
+                                and not read_only(command)
+                                and not other_agent(command)
+                                and not GIT_CONTENT.search(command)
+                            ):
+                                session.hints.append(
+                                    Hint(
+                                        f"{sid}:hint:{key}", seq0, ts, tool, cwd, command,
+                                        instruction, model0 or "", effort0,
+                                    )
+                                )
+                                self.counts["write_hints"] += 1
                         if block.get("is_error"):
                             self.skipped["failed_" + ("read" if call[1] == "Read" else "tool")] += 1
                             continue

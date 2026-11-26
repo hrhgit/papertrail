@@ -191,7 +191,10 @@ def test_claude_write_and_codex_child_trace(tmp_path):
         a, b = q.trace(tmp_path / "story", 1)["rows"]
         assert (a["agent"], a["session"], a["prompt"]) == ("codex", "child", "Revise the example.")
         assert (b["agent"], b["tool"]) == ("claude-code", "Bash")
-        assert q.trace(tmp_path / "story", 2)["rows"][0]["kind"] == "drift"
+        drift = q.trace(tmp_path / "story", 2)["rows"][0]
+        assert (drift["kind"], drift["basis"], drift["was"], drift["session"]) == (
+            "inferred", "nearby", "drift", "child",
+        )
 
 
 @pytest.mark.parametrize("cmd", ["cat > x <<D\nx\nD", "echo x > x"])
@@ -225,6 +228,58 @@ def test_completion_event_and_receipt(tmp_path, cmd):
     (s,) = CodexSource().sessions(tmp_path)
     (edit,) = s.edits
     assert edit.after == "x\n"
+    assert not s.hints
+
+
+@pytest.mark.parametrize(
+    "route,command,exit_code,source,expected",
+    [
+        ("receipt", "sed -i '' 's/old/new/' x", 0, "agent", True),
+        ("wrapped", "python3 rewrite.py x", 0, "agent", True),
+        ("dynamic", "node rewrite.js x", 0, "unified_exec_startup", True),
+        ("dynamic", "node rewrite.js x", 0, "user", False),
+        ("receipt+native", "node rewrite.js x", 0, "agent", True),
+        ("receipt+native", "node rewrite.js x", 0, "user", False),
+        ("receipt", "git restore x", 0, "agent", False),
+        ("receipt", "claude -p 'update x'", 0, "agent", False),
+        ("receipt", "cat x", 0, "agent", False),
+        ("receipt", "node rewrite.js x", 1, "agent", False),
+    ],
+)
+def test_write_hints_from_codex_receipts(tmp_path, route, command, exit_code, source, expected):
+    args = json.dumps({"cmd": command})
+    receipt = {"exit_code": exit_code}
+    if route in ("wrapped", "dynamic"):
+        js = (
+            f"text(await tools.exec_command({args}))" if route == "wrapped"
+            else "text(await tools.exec_command({cmd: getCommand()}))"
+        )
+        rows = [call("shell", js, "exec")]
+        if route == "wrapped":
+            rows.append(output("shell", "Script completed\nOutput:\n" + json.dumps(receipt)))
+    else:
+        rows = [
+            ("response_item", {
+                "type": "function_call", "name": "exec_command", "call_id": "shell",
+                "arguments": args,
+            }),
+            output("shell", receipt),
+        ]
+    if route in ("receipt+native", "dynamic"):
+        rows.append(completed(
+            "shell", type="CommandExecution", source=source, cwd=str(tmp_path),
+            command=["/bin/sh", "-c", command], status="completed", exit_code=exit_code,
+        ))
+    rollout(tmp_path, "hint", rows)
+    reader = CodexSource()
+    (s,) = reader.sessions(tmp_path)
+    assert not s.edits
+    assert len(s.hints) == reader.counts["write_hints"] == int(expected)
+    if expected:
+        (hint,) = s.hints
+        assert (hint.command, hint.cwd) == (command, str(tmp_path))
+        assert hint.tool == ("exec" if route in ("wrapped", "dynamic") else "exec_command")
+        assert (hint.prompt, hint.model, hint.effort) == (s.prompts[0].id, "alpha", "high")
 
 
 def test_heredoc_guarded_by_literal_mkdir(tmp_path):
@@ -280,6 +335,8 @@ def test_runtime_command_proves_one_resolved_literal_write(tmp_path, changes, co
         )
     else:
         assert not s.edits
+    if competing:
+        assert len(s.hints) == source.counts["write_hints"] == 1
 
 
 def test_event_directory_is_local_file_url(tmp_path):

@@ -11,7 +11,8 @@ from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
 from ..logfile import ZstdUnavailable, compressed, log_stem, open_log
-from ..model import Edit, Prompt, Session
+from ..model import Edit, Hint, Prompt, Session
+from .claude import GIT_CONTENT, READ_CHUNK, other_agent, read_only
 from .codex_patch import (
     absolute,
     command_string,
@@ -23,7 +24,6 @@ from .codex_patch import (
     wrapper_command,
     wrapper_patch,
 )
-from .claude import READ_CHUNK
 from .shell_write import ECHO_WRITE, shell_edits, shell_status
 
 
@@ -134,6 +134,8 @@ class Rollout:
         self.spawn_calls = {}
         self.launches = []
         self.event_commands = Counter()
+        self.native_commands = set()
+        self.hint_candidates = []
         self.shell_results = []
         self.runtime_shell = {}
         self.finished_shell_calls = set()
@@ -358,14 +360,6 @@ class Rollout:
         call = self.owner(key, turn_id)
         if call:
             call.command_events += 1
-        origin = item.get("source")
-        if (
-            origin not in (None, "agent", "unified_exec_startup")
-            or item.get("plugin_id")
-            or item.get("script_path")
-        ):
-            self.source.skipped["non_agent_command_event"] += 1
-            return
         cmd = command_string(item.get("command"))
         context = call.turn if call else self.turns.get(turn_id, Turn("", "", "", None, turn_id))
         cwd = self.command_directory(item.get("cwd"), context.cwd)
@@ -379,6 +373,15 @@ class Rollout:
         receipt_cwd = cwd
         if len(choices) == 1 and isinstance(choices[0].get("workdir", ""), str):
             receipt_cwd = self.command_directory(choices[0].get("workdir"), inputs[0].cwd)
+        self.native_commands.add((outer, cmd, receipt_cwd))
+        origin = item.get("source")
+        if (
+            origin not in (None, "agent", "unified_exec_startup")
+            or item.get("plugin_id")
+            or item.get("script_path")
+        ):
+            self.source.skipped["non_agent_command_event"] += 1
+            return
         self.event_commands[outer, cmd, receipt_cwd] += 1
         exit_code = item.get("exit_code")
         success = type(exit_code) is int and exit_code == 0 and item.get("status") == "completed"
@@ -387,6 +390,8 @@ class Rollout:
             a.get("cmd") == cmd for n, a in inputs[1] if n == "exec_command"
         )
         status = shell_status(status, item.get("aggregated_output"))
+        tool = call.name if call else "exec_command"
+        self.hint_command(cmd, cwd, context, key, ts, status, tool, outer, native=True)
         argv = item.get("command")
         runtime_literal = (
             not static
@@ -419,7 +424,7 @@ class Rollout:
                     key,
                     ts,
                     status if static else "js_expression",
-                    call.name if call else "exec_command",
+                    tool,
                 )
             )
         patch, cwd = shell_invocation(cmd, cwd)
@@ -462,6 +467,28 @@ class Rollout:
             standalone=standalone,
         )
         return edits
+
+    def hint_command(self, cmd, cwd, turn, key, ts, status, tool, outer, *, native=False):
+        if status != "success" or read_only(cmd) or other_agent(cmd) or GIT_CONTENT.search(cmd):
+            return
+        hint = Hint(
+            f"{self.s.id}:hint:{key}", self.seq, ts, tool, cwd, cmd,
+            turn.prompt, turn.model, turn.effort,
+        )
+        self.hint_candidates.append((hint, key, outer, native))
+
+    def finish_hints(self):
+        proven = {e.call_id for e in self.s.edits}
+        for hint, key, outer, native in self.hint_candidates:
+            if not native and (outer, hint.command, hint.cwd) in self.native_commands:
+                continue
+            if key in proven or (
+                outer in proven
+                and (hint.tool == "exec_command" or shell_invocation(hint.command, hint.cwd)[0])
+            ):
+                continue
+            self.s.hints.append(hint)
+        self.count["write_hints"] += len(self.s.hints)
 
     def shell_result(self, key, value, ts, wrapped):
         info = self.shell_inputs.get(key)
@@ -520,6 +547,9 @@ class Rollout:
                 if receipt:
                     status = "success" if receipt[1] == "0" else "failed"
             status = shell_status(status, result.get("output", text))
+            cmd, cwd, context, origin_key, tool = origin
+            outer = origin_key.rsplit(":", 1)[0]
+            self.hint_command(cmd, cwd, context, origin_key, ts, status, tool, outer)
             for edit in self.write_command(*origin[:4], ts, status, origin[4]):
                 resolved.append(edit)
                 writers[edit.path].add(edit.call_id)
@@ -649,6 +679,7 @@ class Rollout:
             self.settle(call, ts, status)
         for call in self.calls.values():
             self.settle(call, self.s.ended_at, "missing_receipt")
+        self.finish_hints()
         # The protocol's user event disambiguates human input from injected
         # response items. An unmatched response in that turn is not a prompt.
         rejected = {
@@ -664,8 +695,8 @@ class Rollout:
             else:
                 previous[tid] = prompt.id
         self.s.prompts = [p for p in self.s.prompts if p.id not in rejected]
-        for edit in self.s.edits:
-            edit.prompt = redirects.get(edit.prompt, edit.prompt)
+        for record in (*self.s.edits, *self.s.hints):
+            record.prompt = redirects.get(record.prompt, record.prompt)
         self.launches = [(f, v, redirects.get(p, p)) for f, v, p in self.launches]
         self.s.edits.sort(key=lambda e: (e.ts, e.seq))
         if not self.s.title and self.s.prompts:
@@ -922,6 +953,8 @@ class CodexSource:
                     if not edit.prompt:
                         edit.prompt = prompt
                         self.counts["inherited_prompt_edits"] += 1
+                for hint in s.hints:
+                    hint.prompt = hint.prompt or prompt
             if s.parent and not prompt:
                 self.counts["child_missing_" + missing_reason] += sum(
                     e.prompt is None for e in s.edits

@@ -3,11 +3,26 @@
 const PALETTE = ["#d7352b", "#1f6fd1", "#0e9f5b", "#e9a100", "#8a4fbf", "#0097a7", "#d63a8c", "#8c5a33", "#5e8f1e", "#e5652a"];
 // Short names on screen; the full meaning is the tooltip. The legend popover in index.html matches.
 const KIND = {
+  inferred: { who: "Likely agent", tip: "The logs suggest a likely writer", cls: "k-inferred" },
   baseline: { who: "Pre-existing", tip: "In the file before the first recorded session", cls: "k-baseline" },
   external: { who: "External edit", tip: "Changed outside the agents, between two recorded edits", cls: "k-external" },
   drift: { who: "Changed since", tip: "Changed on disk after the last recorded edit", cls: "k-drift" },
   unknown: { who: "Unknown", tip: "Not enough evidence in the logs", cls: "k-unknown" },
 };
+const INFERRED_TIP = {
+  command: "A command in this session named the file",
+  nearby: "Nearest edit to this file by this session",
+};
+
+function kindLabel(row) {
+  const agent = row.agent || state.sessions.get(row.session)?.agent;
+  if (row.kind === "inferred" && agent) return `Likely ${SOURCE_NAMES[agent] || agent}`;
+  return (KIND[row.kind] || KIND.unknown).who;
+}
+
+function kindTip(row) {
+  return (row.kind === "inferred" && INFERRED_TIP[row.basis]) || (KIND[row.kind] || KIND.unknown).tip;
+}
 // The same kinds, said of lines that are gone.
 const GAP_TIP = {
   baseline: "Deleted before the first recorded session",
@@ -408,11 +423,13 @@ function commonRoot(paths) {
 function renderSummary() {
   const s = state.overview.stats;
   const pct = s.agent_fraction == null ? null : Math.round(s.agent_fraction * 100);
+  const included = s.agent_plus_inferred_fraction;
   $("summary").replaceChildren(
     stat("chat", s.sessions, "session", true),
     pct == null
       ? ""
       : h("span", { class: "stat", title: `${pct}% of current lines were written by agents` }, h("span", { class: "share" }, h("i", { style: `width:${pct}%` })), `${pct}% agent-written`),
+    included == null ? "" : h("span", { class: "stat" }, `${Math.round(included * 100)}% including inferred`),
   );
 }
 
@@ -1010,9 +1027,9 @@ function marked(hit) {
 
 // Who wrote a result's line: a session's dot, or the mark for its kind.
 function ownerMark(hit) {
-  if (hit.session) return h("i", { class: "dot", style: `background:${color(hit.session)}`, title: sessionLabel(hit.session) });
+  if (hit.session && hit.kind !== "inferred") return h("i", { class: "dot", style: `background:${color(hit.session)}`, title: sessionLabel(hit.session) });
   const kind = KIND[hit.kind];
-  return kind ? h("i", { class: `key ${kind.cls}`, title: kind.who }) : h("i", { class: "key" });
+  return kind ? h("i", { class: `key ${kind.cls}`, title: kindLabel(hit) }) : h("i", { class: "key" });
 }
 
 function searchGroup(head, count, rows) {
@@ -2075,7 +2092,10 @@ function lineRow(text, n) {
   const range = trackAt(state.file?.tracks || [], n);
   const ids = laneIds(range);
   const tracks = [];
-  if (range && range.kind !== "agent") tracks.push(h("i", { class: KIND[range.kind]?.cls || "k-unknown" }));
+  if (range && range.kind !== "agent") tracks.push(h("i", {
+    class: KIND[range.kind]?.cls || "k-unknown",
+    title: range.kind === "inferred" ? `${kindLabel(range)} · ${kindTip(range)}` : null,
+  }));
   ids.slice(0, MAX_LANES - tracks.length).forEach((id, k) => tracks.push(h("i", { class: k || tracks.length ? "older" : "", style: `background:${color(id)}` })));
   const cls = ["ln"];
   if (state.line === n) cls.push("sel");
@@ -2107,7 +2127,7 @@ function whoMark(range, n) {
 
 // A deletion has no line of its own. It sits between two lines as a small mark
 // in the deleter's color; opened, it shows the lines that used to be there.
-const gapColor = (g) => (g.session ? color(g.session) : "var(--muted)");
+const gapColor = (g) => (g.kind === "agent" && g.session ? color(g.session) : "var(--muted)");
 const gapWhere = (after) => (after ? `after line ${after}` : "at the top");
 const gapLines = (list) => list.reduce((n, g) => n + (g.removed || 0), 0);
 
@@ -2167,14 +2187,14 @@ function renderDeletedRows(gap, top, bottom) {
 function gapBlock(g, after, source, more) {
   const kind = g.kind === "agent" && g.session ? null : KIND[g.kind] || KIND.unknown;
   const who = kind
-    ? [h("i", { class: `key ${kind.cls}` }), h("span", { class: "who" }, kind.who)]
+    ? [h("i", { class: `key ${kind.cls}` }), h("span", { class: "who" }, kindLabel(g))]
     : [h("i", { class: "dot", style: `background:${color(g.session)}` }), h("span", { class: "who" }, sessionLabel(g.session))];
   return h(
     "div",
     { class: "gap-block", style: `--gap:${gapColor(g)}`, "data-gap": g.id },
     h(
       "div",
-      { class: "gap-head", title: kind ? GAP_TIP[g.kind] || kind.tip : null },
+      { class: "gap-head", title: kind ? GAP_TIP[g.kind] || kindTip(g) : null },
       h("span", { class: "tracks", "aria-hidden": "true" }),
       h("span", { class: "num" }),
       h("span", { class: "gap-what" }, h("b", {}, `Deleted ${plural(g.removed, "line")}`), ...who),
@@ -2294,7 +2314,7 @@ function describeGap(after) {
     h("b", {}, after ? `Ln ${after}–${after + 1}` : "Top"),
     `${plural(gapLines(list), "line")} deleted`,
     ids.length ? dots(ids) : h("i", { class: `key ${kind.cls}` }),
-    h("span", { class: "owner" }, kind ? kind.who : sessionLabel(g.session)),
+    h("span", { class: "owner", title: kind && kindTip(g) }, kind ? kindLabel(g) : sessionLabel(g.session)),
   ];
 }
 
@@ -2318,7 +2338,8 @@ function describeOwner(n) {
   const ids = laneIds(range);
   if (range.kind !== "agent") {
     const kind = KIND[range.kind] || KIND.unknown;
-    return [num, h("i", { class: `key ${kind.cls}` }), kind.who, ids.length ? dots(ids) : ""];
+    return [num, h("i", { class: `key ${kind.cls}` }),
+      h("span", { title: kindTip(range) }, kindLabel(range)), ids.length ? dots(ids) : ""];
   }
   return [num, dots(ids), h("span", { class: "owner" }, sessionLabel(ids[0]))];
 }
@@ -2486,7 +2507,7 @@ async function loadTrace(panel) {
     seen.add(key);
     return true;
   });
-  const first = stops.findIndex((r) => r.kind === "agent" && r.session);
+  const first = stops.findIndex((r) => ["agent", "inferred"].includes(r.kind) && r.session);
   state.trace = { n, path, text: text || "", stops, pick: Math.max(0, first) };
   renderTraceView();
 }
@@ -2504,7 +2525,7 @@ async function loadSpan(panel) {
   }
   if (state.panel !== panel) return;
   record("Function history", result.cypher, { path: rel(path), start: result.start, end: result.end });
-  const first = result.rows.findIndex((r) => r.kind === "agent" && r.session);
+  const first = result.rows.findIndex((r) => ["agent", "inferred"].includes(r.kind) && r.session);
   state.trace = { n: item.line, path, text: "", stops: result.rows, pick: Math.max(0, first), span: { ...item, end: result.end } };
   renderTraceView();
 }
@@ -2530,7 +2551,7 @@ async function loadGapTrace(panel) {
 }
 
 const who = (r) => {
-  if (r.kind && (r.kind !== "agent" || !r.session)) return (KIND[r.kind] || KIND.unknown).who;
+  if (r.kind && (r.kind !== "agent" || !r.session)) return kindLabel(r);
   const s = state.sessions.get(r.session);
   const meta = [SOURCE_NAMES[r.agent || s?.agent] || r.agent || s?.agent, r.model || s?.model].filter(Boolean).join(", ");
   const name = sessionLabel(r.session);
@@ -2609,7 +2630,7 @@ function shortWhen(ts) {
 // One chip per session, and one per kind of non-agent change, ordered by
 // its newest change. A chip holds every change of its own, newest first.
 function stopRuns(stops) {
-  const key = (r) => (r.kind === "agent" && r.session ? "s:" + r.session : "k:" + r.kind);
+  const key = (r) => JSON.stringify([r.kind, ["agent", "inferred"].includes(r.kind) ? r.session : null]);
   const runs = new Map();
   stops.forEach((r, i) => {
     if (!runs.has(key(r))) runs.set(key(r), { idx: [] });
@@ -2667,7 +2688,7 @@ function runParts(run) {
   const kind = r.kind === "agent" && r.session ? null : KIND[r.kind] || KIND.unknown;
   return {
     kind,
-    label: kind ? kind.who : sessionLabel(r.session),
+    label: kind ? kindLabel(r) : sessionLabel(r.session),
     mark: kind ? h("i", { class: `key ${kind.cls}` }) : h("i", { class: "dot", style: `background:${color(r.session)}` }),
     day: shortWhen(r.ts),
   };
@@ -2736,9 +2757,12 @@ function showStop(i, writer = null) {
       h(
         "div",
         { class: "kind-note" },
-        h("p", { class: "kind-who" }, h("i", { class: `key ${kind.cls}` }), kind.who),
-        h("p", {}, (gap && GAP_TIP[r.kind]) || kind.tip),
-        r.ts ? h("p", { class: "when" }, r.kind === "external" ? `≈ ${when(r.ts)}` : when(r.ts)) : null,
+        h("p", { class: "kind-who" }, h("i", { class: `key ${kind.cls}` }), kindLabel(r)),
+        h("p", {}, (gap && GAP_TIP[r.kind]) || kindTip(r)),
+        r.prompt ? h("p", {}, r.prompt) : null,
+        r.kind === "inferred" && r.session
+          ? h("button", { type: "button", onclick: () => openSession(r.session) }, "Open session") : null,
+        r.ts ? h("p", { class: "when" }, r.kind === "external" || r.was === "external" ? `≈ ${when(r.ts)}` : when(r.ts)) : null,
       ),
     );
   }

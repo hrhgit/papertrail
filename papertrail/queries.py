@@ -10,12 +10,20 @@ import relate
 
 from .graph import ROOT, swap
 
+INFERENCE_OWNER = """
+OPTIONAL MATCH (h)-[:INFERRED_FROM]->(evidence)<-[ownership]-(likely:Session)
+WHERE type(ownership) IN ['HAS_HINT', 'HAS_EDIT']
+OPTIONAL MATCH (instruction:Prompt)-[:LED_TO]->(evidence)
+"""
 OWNER = """
 OPTIONAL MATCH (s:Session)-[:HAS_EDIT]->(e:Edit)-[:HAS_HUNK]->(h)
 OPTIONAL MATCH (p:Prompt)-[:LED_TO]->(e)
-"""
-FIELDS = """h.kind AS kind, h.ts AS ts, s.agent AS agent, e.model AS model, e.effort AS effort,
-s.id AS session, s.title AS title, p.text AS prompt, e.tool AS tool"""
+""" + INFERENCE_OWNER
+FIELDS = """h.kind AS kind, h.basis AS basis, h.was AS was, h.ts AS ts,
+coalesce(s.agent, likely.agent) AS agent, coalesce(e.model, evidence.model) AS model,
+coalesce(e.effort, evidence.effort) AS effort, coalesce(s.id, likely.id) AS session,
+coalesce(s.title, likely.title) AS title, coalesce(p.text, instruction.text) AS prompt,
+coalesce(e.tool, evidence.tool) AS tool"""
 RANGE = "MATCH (f:File {id:$path})-[:HAS_RANGE]->(r:Range)-[:FROM]->(owner:Hunk)"
 TRACE = (
     RANGE
@@ -27,7 +35,9 @@ MATCH chain=(owner)-[:REPLACED*0..]->(h:Hunk)
     + """
 RETURN length(chain) AS depth, [n IN nodes(chain) | n.id] AS chain,
 [edge IN relationships(chain) | edge.lines] AS replaced_lines,
-e.id AS edit, s.log_path AS log_path, s.cwd AS cwd, s.resume AS resume, s.resume_cwd AS resume_cwd,
+coalesce(e.id, evidence.id) AS edit, coalesce(s.log_path, likely.log_path) AS log_path,
+coalesce(s.cwd, likely.cwd) AS cwd, coalesce(s.resume, likely.resume) AS resume,
+coalesce(s.resume_cwd, likely.resume_cwd) AS resume_cwd,
 [] AS previous_files, [] AS next_files, """
     + FIELDS
     + " ORDER BY depth, chain"
@@ -56,10 +66,18 @@ CALL (e) {
 }
 RETURN e.id AS edit, previous_files, next_files"""
 
-TRACK_RANGES = """
-MATCH (f:File {id:$path})-[:HAS_RANGE]->(r:Range)-[:FROM]->(owner:Hunk)
-RETURN r.start AS start, r.end AS end, owner.kind AS kind, owner.id AS hunk, owner.ts AS ts
+TRACK_RANGES = (
+    RANGE.replace("owner:Hunk", "h:Hunk")
+    + """
+WHERE ($start IS NULL OR r.end >= $start) AND ($end IS NULL OR r.start <= $end)
+"""
+    + INFERENCE_OWNER
+    + """
+RETURN r.start AS start, r.end AS end, h.kind AS kind, h.id AS hunk, h.ts AS ts,
+h.basis AS basis, h.was AS was, likely.id AS session, likely.agent AS agent,
+left(instruction.text, 80) AS prompt, evidence.model AS model, evidence.tool AS tool
 ORDER BY start"""
+)
 
 REPLACED_EDGES = """
 MATCH (h:Hunk)-[:REPLACED]->(old:Hunk)
@@ -259,7 +277,9 @@ WHERE r.end >= $start AND r.start <= $end
             + """
 RETURN CASE WHEN r.start < $start THEN $start ELSE r.start END AS start,
 CASE WHEN r.end > $end THEN $end ELSE r.end END AS end, """
-            + FIELDS.replace("p.text AS prompt", "left(p.text, 80) AS prompt")
+            + FIELDS.replace(
+                "coalesce(p.text, instruction.text)", "left(coalesce(p.text, instruction.text), 80)"
+            )
             + " ORDER BY start"
         )
         result = self._result(
@@ -274,7 +294,7 @@ CASE WHEN r.end > $end THEN $end ELSE r.end END AS end, """
         path, info = self._file(file)
         self._bounds(info, line, line)
         result = self._result(TRACE, {"path": path, "line": line}, limit)
-        hits = [row for row in result["rows"] if row["edit"] is not None]
+        hits = [row for row in result["rows"] if row["edit"] is not None and row["basis"] != "command"]
         if hits:
             files = self._trace_files(hits)
             for row in result["rows"]:
@@ -303,10 +323,7 @@ CASE WHEN r.end > $end THEN $end ELSE r.end END AS end, """
         return files
 
     def _tracks(self, path, start=None, end=None):
-        query = TRACK_RANGES
-        if start is not None:
-            query = query.replace("RETURN", "WHERE r.end >= $start AND ($end IS NULL OR r.start <= $end)\nRETURN", 1)
-        rows = self._run(query, path=path, start=start, end=end)
+        rows = self._run(TRACK_RANGES, path=path, start=start, end=end)
         if not rows:
             return rows
         edges, sessions = self._read_lineage()
@@ -433,7 +450,9 @@ event.id AS id, instruction.id AS prompt_id, instruction.text AS instruction, fi
             counts[label.lower() + "s"] = self._run(f"MATCH (n:{label}) RETURN count(n) AS n")[0][
                 "n"
             ]
-        counts["lines"] = dict.fromkeys(("agent", "baseline", "external", "drift", "unknown"), 0)
+        counts["lines"] = dict.fromkeys(
+            ("agent", "inferred", "baseline", "external", "drift", "unknown"), 0
+        )
         for row in self._run(
             "MATCH (r:Range)-[:FROM]->(h:Hunk) RETURN h.kind AS kind, sum(r.end-r.start+1) AS n"
         ):
@@ -463,4 +482,6 @@ event.id AS id, instruction.id AS prompt_id, instruction.text AS instruction, fi
             agents[row["agent"]]["lines"] = row["n"]
         total = sum(counts["lines"].values())
         counts["agent_fraction"] = counts["lines"]["agent"] / total if total else None
+        attributed = counts["lines"]["agent"] + counts["lines"]["inferred"]
+        counts["agent_plus_inferred_fraction"] = attributed / total if total else None
         return counts

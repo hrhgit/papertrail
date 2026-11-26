@@ -1,6 +1,7 @@
 """Replay one path at a time. Each operation uses pre-change line coordinates."""
 
 import hashlib
+from bisect import bisect_left, bisect_right
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -12,6 +13,7 @@ from stat import S_ISREG
 from .fragments import apply_replacement, hits, locate_later
 from .model import Read, Replacement
 from .patches import changes, lines, patch_changes, positions, sections
+from .sources.claude import command_cwd, names_exactly, tail_name
 
 
 @dataclass
@@ -27,6 +29,9 @@ class Hunk:
     preimage_unknown: bool = False
     # The lines a pure deletion took out. Empty when any of them was unobserved.
     removed_text: str = ""
+    basis: str = ""
+    was: str = ""
+    inferred_from: str | None = None
 
 
 @dataclass
@@ -660,7 +665,7 @@ def following_events(segment, idx):
         yield segment[i]
 
 
-def replay_component(states, events, disks):
+def replay_component(states, events, disks, windows=None):
     # A future observation only belongs to this path until its next lifetime
     # boundary. Build the intervals once, without copying every event suffix.
     intervals = defaultdict(list)
@@ -682,6 +687,7 @@ def replay_component(states, events, disks):
         fresh.open_tail = False
         states[path] = fresh
 
+    observed = {}
     for event in events:
         path = event.path
         op = getattr(event, "operation", "")
@@ -695,12 +701,73 @@ def replay_component(states, events, disks):
             reset(path)
         segment, idx = locations[id(event)]
         disk = disks[path].rows if segment is intervals[path][-1] else None
-        apply_event(states[path], event, following_events(segment, idx), disk)
+        state = states[path]
+        start = len(state.file.hunks)
+        apply_event(state, event, following_events(segment, idx), disk)
+        if windows is not None:
+            # The displayed mismatch time is an estimate. The actual read or
+            # edit that exposed it is the upper bound for matching commands.
+            when = order(event)
+            for h in state.file.hunks[start:]:
+                windows[h.id] = (observed.get(path), when)
+            if (
+                isinstance(event, Read)
+                or event.id not in state.file.unplaced_edits
+                or event.before is not None
+            ):
+                observed[path] = when
+                if op == "move" and event.moved_from != path:
+                    observed[event.moved_from] = when
+    return observed
+
+
+def hint_names(hint, path):
+    if Path(path).name not in hint.command:
+        return False
+    cwd = command_cwd(hint.command, hint.cwd)
+    if names_exactly(hint.command, path, cwd):
+        return True
+    # A short name only identifies a file inside the directory the command ran in;
+    # `README.md` from another project's session is not this file.
+    roots = [Path(d) for d in (hint.cwd, cwd) if d]
+    return any(Path(path).is_relative_to(r) for r in roots) and tail_name(hint.command, path) is not None
+
+
+def infer(file, hints, hint_keys, windows, last_observed):
+    proven = sorted(
+        (windows[h.id][1], h.edit) for h in file.hunks if h.kind == "agent"
+    )
+    proven_keys = [key for key, _ in proven]
+    matches = {}
+    for h in file.hunks:
+        if h.kind not in ("external", "drift", "unknown"):
+            continue
+        previous, observed = windows.get(h.id, (last_observed, None))
+        lo = bisect_right(hint_keys, previous) if previous is not None else 0
+        hi = (
+            bisect_left(hint_keys, observed)
+            if observed is not None
+            else len(hints)
+        )
+        for i in range(hi - 1, lo - 1, -1):
+            if i not in matches:
+                matches[i] = hint_names(hints[i], file.path)
+            if matches[i]:
+                h.inferred_from, h.basis = hints[i].id, "command"
+                break
+        else:
+            if not proven:
+                continue
+            i = bisect_left(proven_keys, observed) if observed is not None else len(proven)
+            h.inferred_from, h.basis = proven[max(0, i - 1)][1], "nearby"
+        h.was, h.kind = h.kind, "inferred"
 
 
 def histories(sessions):
     by_path, reads, neighbors = defaultdict(list), defaultdict(list), defaultdict(set)
+    hints = []
     for session in sessions:
+        hints.extend(session.hints)
         for e in session.edits:
             by_path[e.path].append(e)
             if e.moved_from:
@@ -709,6 +776,8 @@ def histories(sessions):
                 by_path.setdefault(e.moved_from, [])
         for r in session.reads:
             reads[r.path].append(r)
+    hints.sort(key=order)
+    hint_keys = [order(h) for h in hints]
     seen = set()
     for first in sorted(by_path):
         if first in seen:
@@ -723,6 +792,9 @@ def histories(sessions):
         states = {p: State(p) for p in group}
         disks = {p: disk_image(p) for p in group}
         events = sorted((e for p in group for e in (*by_path[p], *reads[p])), key=order)
-        replay_component(states, events, disks)
+        windows = {}
+        observed = replay_component(states, events, disks, windows)
         for path in sorted(group):
-            yield finish(states[path], disks[path])
+            file = finish(states[path], disks[path])
+            infer(file, hints, hint_keys, windows, observed.get(path))
+            yield file

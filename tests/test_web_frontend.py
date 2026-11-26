@@ -35,6 +35,17 @@ vm.runInContext(process.argv[3], ctx);
     return json.loads(result.stdout)
 
 
+def test_inferred_line_label_and_basis():
+    rows = [
+        {"kind": "inferred", "agent": "codex", "basis": "command"},
+        {"kind": "inferred", "agent": "claude-code", "basis": "nearby"},
+    ]
+    assert run_page("console.log(JSON.stringify(input.map(r => [kindLabel(r), kindTip(r)])))", rows) == [
+        ["Likely Codex", "A command in this session named the file"],
+        ["Likely Claude Code", "Nearest edit to this file by this session"],
+    ]
+
+
 @pytest.mark.parametrize("path,source,expected", [
     ("example.js", """\
 function f() {}

@@ -344,10 +344,12 @@ def test_ambiguous_context_and_later_position(tmp_path):
     path.write_text("new\nnew\n")
     (history,) = histories([s])
     assert history.unplaced_edits == {s.edits[1].id}
-    assert all(
-        next(h.kind for h in history.hunks if h.id == owner) == "unknown"
-        for _, _, owner in history.ranges
-    )
+    owners = {h.id: h for h in history.hunks}
+    for _, _, owner in history.ranges:
+        h = owners[owner]
+        assert (h.kind, h.was, h.basis, h.inferred_from) == (
+            "inferred", "unknown", "nearby", s.edits[0].id,
+        )
     path.write_text("old\nnew\n")
     (history,) = histories([s])
     assert not history.unplaced_edits
