@@ -18,6 +18,14 @@ Recording this as code is written is being standardized. Cursor published [Agent
 
 The second user is the agent itself. An agent that is asked to change a line can look up the earlier instruction first and say so when the new request contradicts it. [Let an agent look before it edits](#let-an-agent-look-before-it-edits)
 
+## How it uses Relate
+
+- **Mode:** single file (`relate-db==1.1.0`, embedded in the Python process).
+- **Why this mode:** one closed `.rl` file is the whole history of a project, so it can sit in `.papertrail/` beside the code and be copied or committed like any other file. The CLI, the reader and the agent skill all open the same file read-only. Ingest builds a private file next to it and swaps it in when it is complete, which fits Relate's one-writer-per-store rule. A real graph holds private prompts, and one file is easy to keep out of git. In-memory would mean replaying every transcript on each query. A directory store would spread those prompts over many JSON checkpoints.
+- **What the graph models:** sessions, the instructions a person gave in them, the edits that followed, and the hunks of lines each edit wrote. The relationship that matters is `REPLACED`: a hunk points at the earlier hunks whose lines it overwrote, with the number of lines taken from each. Following it with `REPLACED*0..` gives a line's whole history across agents and sessions, however many rewrites there were, and where two sessions' chains meet is a crossing. `SPAWNED` leads a subagent's edits back to the instruction given to its parent, and `NEXT` orders each session's prompts and edits. [Full schema](#how-the-graph-answers-the-question)
+
+**Where the data lives:** [`demo/project/.papertrail/graph.rl`](demo/project/.papertrail/graph.rl) is the committed graph of the demo below (8 sessions, 23 edits, 25 hunks, 239 relationships). For your own project, ingest writes `.papertrail/graph.rl` in that project and keeps it out of git. [Open the store](#open-the-store) shows how to query it with the `relate` package directly.
+
 ## Why is the retry limit 3?
 
 The repository includes a made-up project and the agent sessions that built it. `demo/project` is a small worker that delivers webhooks. `demo/logs` holds the transcripts of seven sessions spread over three weeks: four in Claude Code, one of which used a subagent, and three in Codex. Nothing in them is real. With Python 3.11+ and uv installed:
