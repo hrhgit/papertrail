@@ -284,6 +284,7 @@ def test_agent_name_in_script_text_is_not_another_writer(tmp_path):
         "bash <<'SH'\ncodex exec 'fix notes.txt'\nSH",
         "cat <<'SH' > run.sh && bash run.sh\nclaude -p 'fix notes.txt'\nSH",
         "ruby <<'RB'\n`codex exec notes.txt`\nRB",
+        "python3 - <<'PY'\nimport os\nos.posix_spawnp('codex', ['codex', 'exec'], {})\nPY",
         "perl <<'PL'\nqx(codex exec notes.txt);\nPL",
         "python3 - <<'PY' && bash run.sh\nopen('run.sh', 'w').write('codex exec notes.txt')\nPY",
         "python3 - <<'PY'\nopen('run.sh', 'w').write('codex exec notes.txt')\nPY\n./run.sh",

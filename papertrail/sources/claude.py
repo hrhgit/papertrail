@@ -133,8 +133,7 @@ def command_cwd(command, cwd):
 # Code that starts another process. A script body mentioning an agent name is only
 # another writer when it can run something.
 LAUNCHES = re.compile(
-    r"`|%x|\b(?:subprocess|os\.system|os\.exec|os\.spawn|popen|execSync|spawnSync"
-    r"|child_process|Open3|spawn|qx|system|exec)\b"
+    r"`|%x|\b(?:subprocess|child_process|Open3|qx|system|\w*exec\w*|\w*spawn\w*|\w*popen\w*)\b"
 )
 # The shell part runs a script file, which the heredoc body may have written.
 RUNS_SCRIPT = re.compile(r"(?:^|[\s;&|(])(?:(?:ba|z|da|k)?sh|source|\.)[ \t]+[^\s<-]|(?:^|[\s;&|(])\./\S")
