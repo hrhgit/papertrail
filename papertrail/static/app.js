@@ -2606,10 +2606,10 @@ function shortWhen(ts) {
   return d.toLocaleDateString(undefined, { year, month: "short", day: "numeric" });
 }
 
-// One chip per session name, and one per kind of non-agent change, ordered by
+// One chip per session, and one per kind of non-agent change, ordered by
 // its newest change. A chip holds every change of its own, newest first.
 function stopRuns(stops) {
-  const key = (r) => (r.kind === "agent" && r.session ? "s:" + sessionLabel(r.session) : "k:" + r.kind);
+  const key = (r) => (r.kind === "agent" && r.session ? "s:" + r.session : "k:" + r.kind);
   const runs = new Map();
   stops.forEach((r, i) => {
     if (!runs.has(key(r))) runs.set(key(r), { idx: [] });
