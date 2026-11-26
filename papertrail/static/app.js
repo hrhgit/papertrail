@@ -467,17 +467,24 @@ function ensureExpanded(path) {
   for (const part of parts) {
     state.expanded.add((acc += part + "/"));
     state.folded.delete(acc);
+    focusFolded.delete(acc);
     const folder = view?.folders.get(acc);
     if (folder) setTreeFolder(view, folder, true);
   }
   updateFoldButton();
 }
 
-const folderOpen = (path) => (state.agentOnly ? !state.folded.has(path) : state.expanded.has(path));
+// A focused session's files start with every folder open; what the reader
+// then folds is kept apart, and forgotten when the focus moves on.
+const focusFolded = new Set();
+// The trees that list only some files open every folder unless it was folded.
+const shut = () => (state.focus ? focusFolded : state.agentOnly ? state.folded : null);
+const folderOpen = (path) => (shut() ? !shut().has(path) : state.expanded.has(path));
+const touchedBy = (e, id) => !!e.graph?.touched?.includes(id);
 
 function toggleFolder(view, folder) {
   const path = folder.dir.path;
-  const set = state.agentOnly ? state.folded : state.expanded;
+  const set = shut() || state.expanded;
   if (set.has(path)) set.delete(path);
   else set.add(path);
   setTreeFolder(view, folder, folderOpen(path));
@@ -486,11 +493,11 @@ function toggleFolder(view, folder) {
 
 function foldAll() {
   const view = filesView.active;
-  state.expanded.clear();
-  if (state.agentOnly) {
+  if (!state.focus) state.expanded.clear();
+  if (shut()) {
     const walk = (node) => {
       for (const dir of node.dirs) {
-        state.folded.add(dir.path);
+        shut().add(dir.path);
         walk(dir);
       }
     };
@@ -507,7 +514,7 @@ function updateFoldButton() {
   filesView.fold.hidden = !view.tree.dirs.length && !view.tree.files.length;
 }
 
-function fileRow(e, depth, label = base(e.path)) {
+function fileRow(e, depth, label = base(e.path), only = null) {
   const f = e.graph;
   const gone = f?.status === "missing" ? "deleted" : f?.status === "unreadable" ? "unreadable" : null;
   const by = f?.edits
@@ -528,7 +535,7 @@ function fileRow(e, depth, label = base(e.path)) {
       onclick: () => openFile(e.path),
     },
     h("span", { class: "name" }, label, gone ? h("span", { class: "tag" }, gone) : null),
-    f?.lines ? authorShare(f) : null,
+    f?.lines ? authorShare(f, only) : null,
   );
 }
 
@@ -537,12 +544,12 @@ const byStart = (ids) =>
 
 // The file from top (left) to bottom (right), with each session's current
 // lines painted in its color where they sit; the rest stays grey.
-function authorShare(f) {
+function authorShare(f, only = null) {
   const total = Math.max(f.lines || 0, ...(f.authors || []).map((a) => a[2]), 1);
   return h(
     "span",
     { class: "share authors" },
-    (f.authors || []).map(([id, start, end]) =>
+    (f.authors || []).filter(([id]) => !only || id === only).map(([id, start, end]) =>
       h("i", { style: `left:${((start - 1) / total) * 100}%;width:${((end - start + 1) / total) * 100}%;background:${color(id)}` }),
     ),
   );
@@ -580,7 +587,7 @@ function treeRows(view, node, depth, out) {
     setTreeFolder(view, folder, folderOpen(dir.path));
   }
   for (const e of node.files) {
-    const row = fileRow(e, depth);
+    const row = fileRow(e, depth, undefined, view.focus);
     view.files.set(e.path, row);
     out.append(row);
   }
@@ -607,14 +614,30 @@ function markFileRow(scroll = false) {
 function showFileTree() {
   const { views, here, body } = filesView;
   const only = state.agentOnly;
-  let view = views.get(only);
+  // Focusing a session narrows the tree to the files it edited.
+  const focus = state.focus && state.sessions.has(state.focus) ? state.focus : null;
+  if (filesView.focus !== focus) focusFolded.clear();
+  filesView.focus = focus;
+  const key = focus ? `focus:${focus}` : only;
+  let view = views.get(key);
   if (!view) {
-    const tree = fileTree(only ? here.filter(agentWrote) : here);
+    const tree = fileTree(focus ? here.filter((e) => touchedBy(e, focus)) : only ? here.filter(agentWrote) : here);
     const rows = h("div");
-    view = { tree, rows, files: new Map(), folders: new Map() };
-    views.set(only, view);
+    view = { tree, rows, files: new Map(), folders: new Map(), focus };
+    views.set(key, view);
+    if (focus) {
+      rows.append(
+        h(
+          "button",
+          { type: "button", class: "tree-focus", title: "Show all files (Esc)", onclick: () => setFocus(null) },
+          h("i", { class: "dot", style: `background:${color(focus)}` }),
+          h("span", { class: "name" }, sessionLabel(focus)),
+          h("span", { class: "x", "aria-hidden": "true" }, "×"),
+        ),
+      );
+    }
     treeRows(view, tree, 0, rows);
-    if (!rows.childElementCount) rows.append(h("p", { class: "none" }, only ? "No agent-edited files" : "Empty folder"));
+    if (!tree.dirs.length && !tree.files.length) rows.append(h("p", { class: "none" }, focus ? "No files in this folder" : only ? "No agent-edited files" : "Empty folder"));
     body.append(rows);
   } else {
     for (const [path, folder] of view.folders) setTreeFolder(view, folder, folderOpen(path));
@@ -623,6 +646,14 @@ function showFileTree() {
   view.rows.hidden = false;
   filesView.active = view;
   filesView.filter.setAttribute("aria-pressed", String(only));
+  filesView.filter.disabled = !!focus;
+  // Files outside the folder follow the same narrowing.
+  let outside = 0;
+  for (const [path, row] of filesView.awayRows) {
+    row.hidden = !!focus && !touchedBy(filesView.awayEntries.get(path), focus);
+    if (!row.hidden) outside++;
+  }
+  if (filesView.away) filesView.away.hidden = !outside;
   updateFoldButton();
   markFileRow();
 }
@@ -645,7 +676,7 @@ function renderFiles() {
     ) : null;
     if (outside) for (const row of awayRows.values()) outside.append(row);
     filesView = {
-      here, awayRows, away: outside, views: new Map(), active: null,
+      here, awayRows, awayEntries: new Map(away.map((entry) => [entry.path, entry])), away: outside, views: new Map(), active: null,
       entries: state.entries, root: state.root, body: h("div"),
     };
   }
@@ -2348,6 +2379,7 @@ function setFocus(id, { save = true } = {}) {
   }
   renderFocus();
   paintMix();
+  if (filesView) showFileTree();
   renderSessions();
   if (save) writeHash();
 }

@@ -76,6 +76,11 @@ FILE_AUTHORS = """
 MATCH (f:File)-[:HAS_RANGE]->(r:Range)-[:FROM]->(:Hunk)<-[:HAS_HUNK]-(:Edit)<-[:HAS_EDIT]-(s:Session)
 RETURN f.path AS path, s.id AS id, r.start AS start, r.end AS end ORDER BY path, start"""
 
+# Every session that edited each file, whether or not its lines are still there.
+FILE_SESSIONS = """
+MATCH (s:Session)-[:HAS_EDIT]->(e:Edit)-[:TOUCHED]->(f:File)
+RETURN f.path AS path, s.id AS id, count(e) AS edits ORDER BY path, id"""
+
 SESSIONS = """
 MATCH (s:Session)
 OPTIONAL MATCH (s)-[:HAS_EDIT]->(e:Edit)
@@ -493,8 +498,12 @@ class ReaderQueries(Queries):
                 spans[-1][2] = max(spans[-1][2], row["end"])
             else:
                 spans.append([row["id"], row["start"], row["end"]])
+        touched = {}
+        for row in self._run(FILE_SESSIONS):
+            touched.setdefault(row["path"], []).append(row["id"])
         for row in files:
             row["authors"] = authors.get(row["path"], [])
+            row["touched"] = touched.get(row["path"], [])
         sessions = self._overview_sessions()
         written = {row["id"]: row["written"] for row in self._run(WRITTEN)}
         alive = {row["id"]: row["alive"] for row in self._run(ALIVE)}

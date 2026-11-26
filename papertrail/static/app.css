@@ -905,3 +905,10 @@ button.link { border: 0; background: none; padding: 0; text-decoration: underlin
 .hpick-row.titled .hpick-face:hover { color: var(--muted); }
 .bar-row > .fate-toggle { flex: none; width: 30px; height: 26px; border-color: transparent; background: none; border-radius: 6px; }
 .bar-row > .fate-toggle:hover, .bar-row > .fate-toggle[aria-expanded="true"] { background: var(--hover); }
+
+/* The file tree narrowed to one session: its name, and a way back. */
+.tree-focus { display: flex; align-items: center; gap: 7px; width: calc(100% - 20px); margin: 0 10px 6px; padding: 3px 8px; border: 1px solid var(--rule); border-radius: 6px; background: var(--paper); font-size: 12.5px; text-align: left; }
+.tree-focus .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tree-focus .x { flex: none; color: var(--muted); font-size: 14px; line-height: 1; }
+.tree-focus:hover { border-color: var(--ink); }
+.tree-row[hidden], .past[hidden] { display: none; }
