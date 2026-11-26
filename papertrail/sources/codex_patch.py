@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ..patches import sections
+from .paths import resolved
+from .shell_write import mask_quoted, script_write
 
 
 @dataclass(frozen=True)
@@ -35,7 +37,7 @@ def absolute(raw, cwd):
     path = Path(raw)
     if not path.is_absolute() and not cwd:
         raise ValueError("missing_workdir")
-    return str((Path(cwd) / path).resolve())
+    return resolved(Path(cwd) / path)
 
 
 def parse_patch(text, cwd):
@@ -125,20 +127,43 @@ def shell_invocation(cmd, cwd):
     return shell_patch(cmd), cwd
 
 
+OPAQUE_HEREDOC = re.compile(r"""<<-?\s*['"]?\w""")
+SED_START = re.compile(r"(?<![^\s;&|/])sed\s+")
+SED_OPTION = re.compile(r"-[^\s]+\s+")
+SED_INPLACE = re.compile(r"-[A-Za-z]*i(?:\s|$|[.'])")
+
+
+def sed_inplace(text):
+    # A pathname inside an option may itself end with /sed. Reuse the result
+    # of trying the same option suffix from that later start.
+    seen = set()
+    for start in SED_START.finditer(text):
+        pos = start.end()
+        while pos not in seen:
+            seen.add(pos)
+            if SED_INPLACE.match(text, pos):
+                return True
+            option = SED_OPTION.match(text, pos)
+            if option is None:
+                break
+            pos = option.end()
+    return False
+
+
 def opaque_categories(cmd):
     # Count command signatures, not files. Quoted search patterns and code in
     # a heredoc must not turn a read-only shell command into a redirect/sed.
-    header = re.split(r"<<-?\s*['\"]?\w+['\"]?[^\n]*\n", cmd, maxsplit=1)[0]
-    unquoted = re.sub(r"""'(?:[^']*)'|"(?:\\.|[^"\\])*" """.strip(), "ARG", header)
+    # The original signature requires a word after << and a newline after it.
+    last_newline = cmd.rfind("\n")
+    doc = OPAQUE_HEREDOC.search(cmd, 0, last_newline) if last_newline != -1 else None
+    header = cmd[:doc.start()] if doc else cmd
+    unquoted = mask_quoted(header)
     if re.search(r"(?<![<>=])>{1,2}(?![>&=])\s*[^&\s]", unquoted):
         yield "redirect"
-    if re.search(r"(?:^|[\s;&|/])sed\s+(?:-[^\s]+\s+)*?-[A-Za-z]*i(?:\s|$|[.'])", unquoted):
+    if sed_inplace(unquoted):
         yield "sed_inplace"
     interpreter = re.search(r"(?:^|[\s;&|/])(?:python[.\d]*|node|ruby)\s", unquoted)
-    if interpreter and re.search(
-        r"\b(?:write_text|write_bytes|writeFileSync|writeFile|writelines)\s*\(|\bopen\([^\n)]*,\s*['\"][wax]",
-        cmd,
-    ):
+    if interpreter and script_write(cmd):
         yield "script_write"
 
 

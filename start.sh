@@ -4,7 +4,7 @@
 #   ./start.sh                 graph for this repository, built from your own agent logs
 #   ./start.sh ~/code/my-app   graph for another project
 #   ./start.sh demo            bundled made-up project and sessions (no private logs involved)
-#   ./start.sh -r [target]     rebuild the graph first (after new sessions or edits)
+#   ./start.sh -r [target]     rebuild the graph in the reader (after new sessions or edits)
 #
 # Environment: PORT (default 8765, next free port is used if taken), NO_BROWSER=1.
 set -euo pipefail
@@ -32,7 +32,6 @@ if [[ "$demo" == 1 ]]; then
   target="$repo/demo/project"
   store="$target/.papertrail/graph.rl"
   # The repository ships this graph. Its paths are relative to demo/, so it opens anywhere.
-  ingest=(--claude-logs demo/logs/claude --codex-logs demo/logs/codex --project "$target" --portable demo)
 else
   [[ -d "$target" ]] || {
     echo "Not a directory: $target" >&2
@@ -47,14 +46,28 @@ else
     [[ -e "$target/.papertrail/.gitignore" ]] || echo '*' >"$target/.papertrail/.gitignore"
     mv "$old" "$store"
   fi
-  ingest=(--project "$target")
 fi
 
+args=(--store "$store" --project "$target")
+if [[ "$demo" == 1 ]]; then
+  args+=(--claude-logs demo/logs/claude --codex-logs demo/logs/codex --portable demo)
+fi
 if [[ "$refresh" == 1 || ! -f "$store" ]]; then
-  echo "Building the graph for: $target (reads local logs, can take up to a minute)"
-  uv run --locked papertrail ingest "${ingest[@]}" --store "$store" --json >/dev/null
+  args+=(--build)
 else
-  echo "Using the existing graph. Run './start.sh -r' to rebuild it from current logs."
+  complete="$(uv run --locked python - "$store" <<'PY'
+import sys
+from papertrail.queries import Queries
+
+with Queries(sys.argv[1]) as graph:
+    print("true" if graph.complete else "false")
+PY
+)"
+  if [[ "$complete" == "false" ]]; then
+    args+=(--build)
+  else
+    echo "Using the existing graph. Run './start.sh -r' to rebuild it from current logs."
+  fi
 fi
 
 port="$(uv run --locked python - "${PORT:-8765}" <<'PY'
@@ -69,7 +82,7 @@ while True:
 PY
 )"
 
-args=(--store "$store" --project "$target" --port "$port")
+args+=(--port "$port")
 [[ -n "${NO_BROWSER:-}" ]] && args+=(--no-browser)
 echo "Paper Trail reader: http://127.0.0.1:$port  (Ctrl+C to stop)"
 exec uv run --locked papertrail ui "${args[@]}"

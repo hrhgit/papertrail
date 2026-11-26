@@ -111,6 +111,11 @@
   <p class="status-line" id="status-line" aria-live="polite"></p>
   <p class="status-line status-tip" id="status-tip" hidden></p>
   <button type="button" id="stale-tag" class="stale-tag" hidden>Outdated · Rebuild</button>
+  <div class="history-status" id="history-progress" hidden>
+    <span class="meter" role="progressbar" aria-label="Reading older logs" aria-valuemin="0" aria-valuemax="100"><i></i></span>
+    <span class="history-status-text"></span>
+  </div>
+  <button type="button" class="status-btn history-status" id="history-incomplete" title="Build the remaining history" hidden>History incomplete</button>
   <button type="button" id="legend-button" class="status-btn" popovertarget="legend">Legend</button>
   <button type="button" id="cypher-toggle" class="status-btn" aria-pressed="false" title="The Cypher behind this view">Cypher</button>
 </footer>

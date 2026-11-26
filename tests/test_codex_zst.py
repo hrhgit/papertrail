@@ -146,3 +146,98 @@ def test_multi_frame_rollout_reads_whole(tmp_path, decoder):
     plain, _ = parsed(layout(tmp_path / "plain", False).parents[3])
     packed, _ = parsed(root)
     assert packed == plain
+
+
+def test_cache_reuses_compressed_replica_group_and_prefilter_finds_packed_path(tmp_path, monkeypatch):
+    from papertrail.ingest import prefilter
+    from papertrail.sources import load_sources
+
+    root = tmp_path / "logs"
+    plain = layout(root, False)
+    packed = plain.with_name(plain.name + ".zst")
+    marker = tmp_path / "project"
+    packed.write_bytes(compress(plain.read_bytes() + b'{"type":"note","payload":{"path":"' +
+                                str(marker).encode() + b'"}}\n'))
+    roots = {"codex": root}
+    assert prefilter(roots, marker) == {plain, packed}
+    expected = load_sources(roots, cache=False)
+    assert load_sources(roots) == expected
+
+    def fail(*args, **kwargs):
+        pytest.fail("Warm ingest reopened a rollout replica")
+
+    monkeypatch.setattr(CodexSource, "raw_lines", fail)
+    assert load_sources(roots) == expected
+
+
+def test_compressed_rollout_reports_progress_while_reading(tmp_path, decoder, monkeypatch):
+    import os
+
+    from papertrail.sources import codex as codex_module
+
+    if decoder == "command":
+        pytest.skip("the zstd command does not say how much input it consumed")
+    folder = tmp_path / "big" / "2025"
+    folder.mkdir(parents=True)
+    filler = b"".join(
+        b'{"type":"note","payload":{"text":"' + os.urandom(512).hex().encode() + b'"}}\n'
+        for _ in range(2000)
+    )
+    path = folder / (FIXTURE.name + ".zst")
+    path.write_bytes(compress(FIXTURE.read_bytes() + filler))
+    monkeypatch.setattr(codex_module, "READ_CHUNK", 64 * 1024)
+    ticks = []
+    list(CodexSource().sessions(tmp_path / "big", progress=lambda p, n=None: ticks.append(n)))
+    partial = [n for n in ticks if n is not None]
+    assert len(partial) > 1
+    assert sum(partial) <= path.stat().st_size
+
+
+@pytest.mark.parametrize("header_scan", [False, True])
+@pytest.mark.parametrize("packed", [False, True])
+def test_cancel_inside_one_codex_file(tmp_path, monkeypatch, header_scan, packed):
+    from papertrail.sources import codex as codex_module
+
+    path = tmp_path / ("rollout-example.jsonl.zst" if packed else "rollout-example.jsonl")
+    filler = b'{"type":"note","payload":{"text":"' + b"x" * 2048 + b'"}}\n'
+    contents = filler * 4096
+    path.write_bytes(compress(contents) if packed else contents)
+    monkeypatch.setattr(codex_module, "READ_CHUNK", 4096)
+
+    class Interrupted(Exception):
+        pass
+
+    reads = 0
+    checks = 0
+    original = codex_module.open_log
+
+    class Stream:
+        def __enter__(self):
+            self.inner = original(path)
+            return self
+
+        def __exit__(self, *args):
+            self.inner.close()
+
+        def readline(self, limit):
+            nonlocal reads
+            reads += 1
+            return self.inner.readline(limit)
+
+    def check():
+        nonlocal checks
+        checks += 1
+        if checks > 1:
+            raise Interrupted
+
+    monkeypatch.setattr(codex_module, "open_log", lambda _: Stream())
+    source = CodexSource()
+    source.log_sizes = {path: path.stat().st_size}
+    source.check = check
+    with pytest.raises(Interrupted):
+        if header_scan:
+            source.headers([path], check=check)
+        else:
+            list(source.records(path))
+    assert 0 < reads < 4096
+    assert not source.broken

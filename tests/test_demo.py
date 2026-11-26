@@ -28,13 +28,14 @@ def files(root):
 
 
 def test_demo_is_what_the_script_writes(tmp_path):
+    output = tmp_path / "demo"
     made = subprocess.run(
-        [sys.executable, ROOT / "scripts/make_demo.py", tmp_path], capture_output=True, text=True
+        [sys.executable, ROOT / "scripts/make_demo.py", output], capture_output=True, text=True
     )
     assert made.returncode == 0, made.stderr
-    names = files(tmp_path)
+    names = files(output)
     assert names == files(DEMO) and len(names) == 17
-    assert filecmp.cmpfiles(tmp_path, DEMO, names, shallow=False)[1:] == ([], [])
+    assert filecmp.cmpfiles(output, DEMO, names, shallow=False)[1:] == ([], [])
 
 
 @pytest.fixture(scope="module")

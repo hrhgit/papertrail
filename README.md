@@ -64,7 +64,7 @@ From the Paper Trail checkout:
 ./start.sh /absolute/path/to/project
 ```
 
-This reads your Claude Code (`~/.claude/projects`) and Codex (`~/.codex/sessions`) logs, keeps the sessions that edited files in that project, writes the graph to `.papertrail/graph.rl` inside it, and opens the reader. Later runs reuse that graph; run `./start.sh -r /absolute/path/to/project` after new sessions to rebuild it. The first build of a long Codex history can take a few minutes.
+Paper Trail reads Claude Code (`~/.claude/projects`) and Codex (`~/.codex/sessions`) logs and saves the project's history to `.papertrail/graph.rl`. The reader shows history as soon as the first pass is ready, and the status bar shows progress while the rest of the logs are read in the background. Run `./start.sh -r /absolute/path/to/project` after new sessions to rebuild the graph. Later builds reuse a private local parse cache in `~/.cache/papertrail`.
 
 To build without opening the reader:
 
@@ -137,7 +137,7 @@ Run the command again if you move the Paper Trail checkout. The agent only reads
 
 ### Privacy
 
-The graph contains your private prompts, file paths and code excerpts, and stays on your machine. Ingest writes a `.gitignore` into a new `.papertrail` folder so the graph stays out of your repository. The only committed graph here is the demo's, which holds made-up sessions. Ingest prints only counts; queries show details from your conversations.
+The graph and parse cache contain private prompts, file paths and code excerpts and stay on your machine. The cache lives outside your repository. Ingest writes a `.gitignore` into a new `.papertrail` folder so the graph stays out of your repository. The only committed graph here is the demo's, which holds made-up sessions. Ingest prints only counts; queries show details from your conversations.
 
 ## How it uses Relate
 

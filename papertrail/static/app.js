@@ -310,7 +310,7 @@ function sessionLabel(id) {
 // A far jump (another file, or ten or more lines away) leaves a history entry, so
 // Back returns to where the reader was. Nearer moves rewrite the current entry.
 const FAR = 10;
-const nav = { at: null, quiet: false, i: history.state?.i || 0, top: 0, restore: 0, fileRequest: 0 };
+const nav = { at: null, quiet: false, i: history.state?.i || 0, top: 0, restore: 0, fileRequest: 0, pendingFile: null };
 try {
   nav.top = Math.max(nav.i, Number(sessionStorage.getItem("papertrail-nav-top")) || 0);
 } catch {
@@ -360,6 +360,7 @@ async function restoreHash() {
   const saved = history.state?.panel;
   const restoring = ++nav.restore;
   nav.fileRequest++;
+  nav.pendingFile = null;
   nav.i = history.state?.i ?? nav.i;
   nav.quiet = true;
   try {
@@ -1616,16 +1617,21 @@ function closeFind() {
 
 /* ---------- File view ---------- */
 
-async function openFile(path, line = null, { keepFocus = true, keepPanel = false, gap = null, panel } = {}) {
+async function openFile(path, line = null, { keepFocus = true, keepPanel = false, gap = null, panel, refresh = false } = {}) {
   const request = ++nav.fileRequest;
-  let file;
+  let file, pending;
   try {
-    file = await api("file", { path, deleted: 0 });
+    pending = api("file", { path, deleted: 0 });
+    if (!refresh) nav.pendingFile = pending;
+    file = await pending;
   } catch (err) {
     if (request === nav.fileRequest) toast(err.message);
     return;
+  } finally {
+    if (nav.pendingFile === pending) nav.pendingFile = null;
   }
   if (request !== nav.fileRequest) return;
+  const current = refresh ? whereNow() : null;
   state.file = file;
   if (!keepFocus) state.focus = null;
   addTab(file.path);
@@ -1640,14 +1646,25 @@ async function openFile(path, line = null, { keepFocus = true, keepPanel = false
     if (!state.gapsAt.has(at)) state.gapsAt.set(at, []);
     state.gapsAt.get(at).unshift(g);
   }
-  state.openGaps = new Set();
-  state.fullGaps = new Set();
-  state.line = null;
-  state.gap = null;
+  if (current) {
+    state.line = last && current.line ? Math.min(last, current.line) : null;
+    state.gap = state.gapsAt.has(current.gap) ? current.gap : null;
+  } else {
+    state.openGaps = new Set();
+    state.fullGaps = new Set();
+    state.line = null;
+    state.gap = null;
+  }
   renderFile();
   renderTabs();
   markFileRow(true);
   renderCrossings();
+  if (current) {
+    markSelected();
+    const history = refreshHistoryPanel();
+    writeHash();
+    return history;
+  }
   if (gap != null && state.gapsAt.has(gap)) selectGap(gap, { open: true, scroll: true, panel });
   else if (line && file.lines?.length) selectLine(line, { scroll: true, panel });
   else if (panel || !keepPanel) showPanel(panel || { view: "intro" });
@@ -1702,6 +1719,7 @@ function clearFile() {
   state.line = null;
   resetFileView();
   nav.fileRequest++;
+  nav.pendingFile = null;
   state.gapsAt = new Map();
   state.gap = null;
   $("gaps-toggle").hidden = true;
@@ -2434,7 +2452,7 @@ function selectLine(n, { scroll = false, span = null, panel } = {}) {
   if (scroll) scrollToFileRow(n - 1);
   if (!panel) {
     const path = state.file.path;
-    if (span && state.file.status !== "untracked") {
+    if (span) {
       const { line, end, name, kind } = span;
       panel = { view: "span", path, span: { line, end, name, kind } };
     } else {
@@ -2472,6 +2490,24 @@ function showPanel(panel) {
   setPanel(h("div", { class: "empty" }, "Click a line to see who wrote it, and the conversation behind it."));
 }
 
+async function refreshHistoryPanel() {
+  const panel = { ...state.panel };
+  if (panel.view !== "trace" && panel.view !== "span") return;
+  if (panel.view === "trace" && panel.gap == null && panel.path === state.file.path) {
+    panel.line = state.line ?? panel.line;
+    panel.text = state.file.lines?.[panel.line - 1] || "";
+  }
+  const scroll = $("panel").scrollTop;
+  const chatScroll = $("chat-body")?.scrollTop;
+  const loading = showPanel(panel);
+  const active = state.panel;
+  await loading;
+  if (active !== state.panel) return;
+  $("panel").scrollTop = scroll;
+  const chat = $("chat-body");
+  if (chat && chatScroll != null) chat.scrollTop = chatScroll;
+}
+
 // The clicked line, quoted under the heading. A blank line has nothing to quote.
 function snippet(n) {
   const text = state.file.lines?.[n - 1] || "";
@@ -2482,14 +2518,18 @@ function panelError(text) {
   setPanel(h("div", { class: "empty" }, text));
 }
 
+function showUntrackedHistory(path, line) {
+  if (state.file?.path !== path || state.file.status !== "untracked") return false;
+  setPanel([
+    h("div", { class: "panel-head" }, h("h2", {}, `Line ${line}`), snippet(line)),
+    h("div", { class: "empty" }, state.overview ? "No agent edits in this file" : "No history yet"),
+  ]);
+  return true;
+}
+
 async function loadTrace(panel) {
   const { path, line: n, text } = panel;
-  if (state.file?.path === path && state.file.status === "untracked") {
-    return setPanel([
-      h("div", { class: "panel-head" }, h("h2", {}, `Line ${n}`), snippet(n)),
-      h("div", { class: "empty" }, state.overview ? "No agent edits in this file" : "No history yet"),
-    ]);
-  }
+  if (showUntrackedHistory(path, n)) return;
   let result;
   try {
     result = await api("trace", { path, line: n });
@@ -2509,13 +2549,14 @@ async function loadTrace(panel) {
   });
   const first = stops.findIndex((r) => ["agent", "inferred"].includes(r.kind) && r.session);
   state.trace = { n, path, text: text || "", stops, pick: Math.max(0, first) };
-  renderTraceView();
+  return renderTraceView();
 }
 
 // A whole function's history, from the outline: one stop per instruction that
 // shaped its lines, shown the way a single line's changes are.
 async function loadSpan(panel) {
   const { path, span: item } = panel;
+  if (showUntrackedHistory(path, item.line)) return;
   let result;
   try {
     result = await api("span", { path, start: item.line, end: item.end });
@@ -2527,12 +2568,12 @@ async function loadSpan(panel) {
   record("Function history", result.cypher, { path: rel(path), start: result.start, end: result.end });
   const first = result.rows.findIndex((r) => ["agent", "inferred"].includes(r.kind) && r.session);
   state.trace = { n: item.line, path, text: "", stops: result.rows, pick: Math.max(0, first), span: { ...item, end: result.end } };
-  renderTraceView();
+  return renderTraceView();
 }
 
 async function loadGapTrace(panel) {
   const { path, gap } = panel;
-  let stops = state.file?.path === path && state.gapsAt.get(gap);
+  let stops = state.file?.path === path && (state.gapsAt.get(gap) || []);
   let otherFile = null;
   if (!stops) {
     try {
@@ -2547,7 +2588,7 @@ async function loadGapTrace(panel) {
   if (state.panel !== panel) return;
   const pick = Math.max(0, stops.findIndex((g) => g.session));
   state.trace = { gap, n: gap, path, text: "", stops, pick, otherFile };
-  renderTraceView();
+  return renderTraceView();
 }
 
 const who = (r) => {
@@ -2616,7 +2657,7 @@ function renderTraceView() {
   const body = h("div", { class: "chat-body", id: "chat-body" });
   setPanel([head, body], true);
   if (!t.stops.length) return body.replaceChildren(h("div", { class: "empty" }, "No recorded history"));
-  showStop(t.pick, writer);
+  return showStop(t.pick, writer);
 }
 
 function shortWhen(ts) {
@@ -2750,7 +2791,8 @@ function showStop(i, writer = null) {
   const body = $("chat-body");
   const gap = t.gap != null;
   if (gap) gapConversationToken++;
-  if (gap && gapOrigin(r, writer)) return;
+  const restored = gap && gapOrigin(r, writer);
+  if (restored) return restored;
   if (r.kind !== "agent" || !r.session) {
     const kind = KIND[r.kind] || KIND.unknown;
     return body.replaceChildren(
@@ -2809,8 +2851,7 @@ function gapOrigin(r, restoreWriter) {
     rememberPanel({ writer: { session: w.session, edit: w.edit } });
     for (const el of document.querySelectorAll(".hrow, .writer")) el.setAttribute("aria-selected", "false");
     box.querySelector(`[data-session="${CSS.escape(w.session)}"]`)?.setAttribute("aria-selected", "true");
-    showGapConversation($("chat-body"), r, w.session, { edit: w.edit, stop: { ...w, depth: 1 }, tag: "wrote the deleted lines" }, "add");
-    return true;
+    return showGapConversation($("chat-body"), r, w.session, { edit: w.edit, stop: { ...w, depth: 1 }, tag: "wrote the deleted lines" }, "add") || true;
   };
   box.replaceChildren(
     h("span", { class: "label" }, "Written by"),
@@ -3905,6 +3946,10 @@ function bindEvents() {
   bindCodeHover();
   $("gaps-toggle").addEventListener("click", toggleAllGaps);
   $("stale-tag").addEventListener("click", () => buildHistory());
+  $("history-incomplete").addEventListener("click", () => {
+    if (state.workspace?.project) buildHistory();
+    else pickFolder({ rebuild: true });
+  });
   // Raise the legend just above its button in the status bar, kept on screen.
   $("legend").addEventListener("beforetoggle", (e) => {
     if (e.newState !== "open") return;
@@ -4201,7 +4246,7 @@ function folderItem(f) {
 }
 
 function quickOpenFolder() {
-  if (state.building) return toast(BUILD_BUSY);
+  if (quickBuildRunning()) return toast(BUILD_BUSY);
   const home = state.workspace?.home || "";
   openPalette({
     placeholder: "Folder name, or a path like ~/projects/app",
@@ -4251,15 +4296,15 @@ function quickOpenFolder() {
 function menuItems() {
   const recent = stored("papertrail-recent", []).filter((p) => p !== state.workspace?.project).slice(0, 5);
   return [
-    { label: "Open Folder…", key: `${MOD}O`, run: pickFolder, disabled: state.building },
-    { label: "Open Recent…", key: IS_MAC ? "⌃R" : "Ctrl+R", run: quickOpenFolder, disabled: state.building },
+    { label: "Open Folder…", key: `${MOD}O`, run: pickFolder, disabled: quickBuildRunning() },
+    { label: "Open Recent…", key: IS_MAC ? "⌃R" : "Ctrl+R", run: quickOpenFolder, disabled: quickBuildRunning() },
     { label: "Open File…", key: `${MOD}P`, run: quickOpenFile, disabled: !state.overview },
     { label: "Go to Line…", key: IS_MAC ? "⌃G" : "Ctrl+G", run: goToLine, disabled: !state.file?.lines },
     { label: "Find in File…", key: `${MOD}F`, run: openFind, disabled: !state.file?.lines },
     { label: "Search…", key: IS_MAC ? "⇧⌘F" : "Ctrl+Shift+F", run: openSearch, disabled: !state.workspace?.project && !state.overview },
     null,
-    { label: "Rebuild History", run: () => buildHistory(), disabled: !state.workspace?.project || state.building, title: "Read the agent logs again" },
-    ...(recent.length ? [null, { label: "Recent folders", group: true }, ...recent.map((p) => ({ label: base(p), detail: rel(p), title: p, run: () => openFolder(p), disabled: state.building }))] : []),
+    { label: "Rebuild History", run: () => buildHistory(), disabled: !state.workspace?.project || quickBuildRunning(), title: "Read the agent logs again" },
+    ...(recent.length ? [null, { label: "Recent folders", group: true }, ...recent.map((p) => ({ label: base(p), detail: rel(p), title: p, run: () => openFolder(p), disabled: quickBuildRunning() }))] : []),
   ];
 }
 
@@ -4323,10 +4368,10 @@ function resetWorkspace() {
 
 // The browser can't hand a page a real folder path, so the local server shows the
 // system's own folder dialog and returns the choice.
-async function pickFolder() {
+async function pickFolder({ rebuild = false } = {}) {
   closeMenu();
   closePalette();
-  if (state.building) return toast(BUILD_BUSY);
+  if (quickBuildRunning()) return toast(BUILD_BUSY);
   if (pickFolder.busy) return;
   pickFolder.busy = true;
   document.body.classList.add("picking");
@@ -4343,23 +4388,28 @@ async function pickFolder() {
     document.body.classList.remove("picking");
   }
   hideToast();
-  if (result.path) await openFolder(result.path);
+  if (result.path && await openFolder(result.path) && rebuild) await buildHistory();
 }
 
 async function openFolder(path) {
   closePalette();
-  if (state.building) return toast(BUILD_BUSY);
+  if (quickBuildRunning()) return toast(BUILD_BUSY);
   let ws;
   try {
     ws = await post("open", { path });
   } catch (err) {
     return toast(err.message);
   }
+  buildFollow++;
+  state.building = false;
+  state.buildStatus = null;
   state.workspace = ws;
+  renderHistoryStatus();
   resetWorkspace();
   rememberFolder(ws.project);
   if (ws.ready) await loadOverview({ restore: false });
   else await showUnbuilt();
+  return true;
 }
 
 // A folder with no graph still opens like an editor: its files, as plain text.
@@ -4417,62 +4467,97 @@ const BUILD_STAGES = ["find", "read", "select", "replay", "write", "done"];
 const SOURCE_NAMES = { "claude-code": "Claude Code", codex: "Codex" };
 const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
 let buildView = null;
+let buildFollow = 0;
+
+function quickBuildRunning() {
+  return state.building && state.buildStatus?.phase === "quick";
+}
 
 async function buildHistory() {
   const ws = state.workspace;
-  if (!ws?.project || state.building) return;
+  if (!ws?.project || quickBuildRunning() || buildHistory.pending) return;
   closeMenu();
   let status;
+  buildHistory.pending = true;
   try {
     status = await post("build", { path: ws.project });
   } catch (err) {
     return toast(err.message);
+  } finally {
+    buildHistory.pending = false;
   }
-  await followBuild(status);
+  if (ws.project === state.workspace?.project) await followBuild(status);
 }
 
 // Also picks up a build that was already running when this page loaded.
 async function followBuild(status) {
-  const ws = state.workspace;
-  state.building = true;
-  state.buildStatus = status;
-  state.buildEta = null;
-  if (state.overview) resetWorkspace();
-  state.workspace = { ...ws, ready: false, building: true };
-  if (state.file) clearFile();
-  await showUnbuilt();
-  while (status.running) {
+  const following = ++buildFollow;
+  let phase;
+  while (following === buildFollow && status.project === state.workspace.project) {
+    const previous = state.workspace;
+    state.workspace = { ...previous, ready: status.ready, complete: status.complete, building: status.running };
+    state.building = status.running;
+    if (status.phase !== phase) state.buildEta = null;
+    state.buildStatus = status;
+    if (!status.running) break;
+    if (status.ready && (!state.overview || previous.complete !== status.complete)) {
+      await loadOverview({ preserve: true });
+    } else if (!status.ready && !phase) {
+      await showUnbuilt();
+    }
+    if (following !== buildFollow) return;
+    phase = status.phase;
     updateBuild(status);
     await sleep(BUILD_POLL_MS);
+    if (following !== buildFollow) return;
     try {
       status = await api("build");
     } catch (err) {
+      if (following !== buildFollow) return;
       state.building = false;
-      showBuild();
+      state.buildStatus = null;
+      renderHistoryStatus();
+      if (!state.workspace.ready) showBuild();
       renderFiles();
       return toast(err.message);
     }
   }
-  updateBuild(status);
-  state.building = false;
+  if (following !== buildFollow || status.project !== state.workspace.project) return;
   buildView = null;
-  if (status.stage !== "done") {
+  renderHistoryStatus();
+  if (status.phase === "done") {
+    state.agentFolders = null;
+    rememberFolder(status.project);
+    toast("History complete");
+    await loadOverview({ preserve: true });
+  } else {
     toast(status.error || "The build stopped early.", 6000);
-    try {
-      state.workspace = await api("workspace");
-    } catch {
-      /* Keep the last known workspace. */
-    }
-    if (state.workspace.ready) return loadOverview({ restore: false });
-    return showUnbuilt();
+    if (!state.workspace.ready) await showUnbuilt();
+    else if (state.overview?.complete !== state.workspace.complete) await loadOverview({ preserve: true });
   }
-  const result = status.result;
-  state.workspace = result;
-  state.agentFolders = null;
-  rememberFolder(result.project);
-  toast(`Built: ${result.sessions} of ${plural(result.sessions_read, "session")}, ${result.seconds}s`, 4000);
-  // A file opened while the build ran reopens with its tracks.
-  await loadOverview({ restore: true });
+}
+
+function renderHistoryStatus(st = state.buildStatus) {
+  const ws = state.workspace;
+  const progress = $("history-progress");
+  const running = ws?.ready && st?.running && st.phase === "full";
+  progress.hidden = !running;
+  const retry = $("history-incomplete");
+  retry.hidden = !(ws?.ready && ws.complete === false && !state.building);
+  retry.title = ws?.project ? "Build the remaining history" : "Choose the project folder to finish building";
+  if (!running) return;
+  const pct = buildPercent(st);
+  const meter = progress.querySelector(".meter");
+  meter.firstChild.style.width = `${pct}%`;
+  meter.setAttribute("aria-valuenow", String(pct));
+  progress.querySelector(".history-status-text").textContent = [
+    `Reading older logs… ${pct}%`, timeLeft(st),
+  ].filter(Boolean).join(" · ");
+  progress.title = (st.sources || []).map((s) => {
+    const name = SOURCE_NAMES[s.name] || s.name;
+    return s.missing ? `${name} — No logs` :
+      `${name} — ${s.read_files} of ${plural(s.files, "file")} · ${bytes(s.read_bytes)} of ${bytes(s.bytes)}`;
+  }).join("\n");
 }
 
 function buildPercent(st) {
@@ -4596,6 +4681,8 @@ function stepRow() {
 
 function updateBuild(st) {
   state.buildStatus = st;
+  renderHistoryStatus(st);
+  if (state.workspace.ready) return;
   const pct = buildPercent(st);
   $("summary").replaceChildren();
   document.title = `${pct}% · ${base(st.project)} — Paper Trail`;
@@ -4716,14 +4803,20 @@ function loom() {
   return svg;
 }
 
-async function loadOverview({ restore = true } = {}) {
-  let tree;
+async function loadOverview({ restore = true, preserve = false } = {}) {
+  const workspace = state.workspace?.project;
+  let overview, tree;
   try {
-    [state.overview, tree] = await Promise.all([api("overview"), state.workspace?.project ? api("tree") : null]);
+    [overview, tree] = await Promise.all([api("overview"), workspace ? api("tree") : null]);
   } catch (err) {
-    $("summary").textContent = err.message;
+    if (workspace === state.workspace?.project) $("summary").textContent = err.message;
     return;
   }
+  if (workspace !== state.workspace?.project) return;
+  const alreadyOpen = state.overview;
+  state.overview = overview;
+  state.workspace = { ...state.workspace, complete: overview.complete };
+  renderHistoryStatus();
   state.tree = tree;
   record("Overview", state.overview.cypher);
   state.sessions.clear();
@@ -4736,6 +4829,18 @@ async function loadOverview({ restore = true } = {}) {
   renderFiles();
   renderCrossings();
   renderSessions();
+  if (preserve) {
+    conversations.clear();
+    // The user may have clicked another file while the overview was loading.
+    // Refresh that destination after the click settles, even if its first
+    // response came from the previous graph.
+    while (nav.pendingFile) {
+      await nav.pendingFile.catch(() => {});
+      if (workspace !== state.workspace?.project) return;
+    }
+    if (state.file) return openFile(state.file.path, null, { refresh: true });
+    if (alreadyOpen) return;
+  }
   const want = restore ? readHash() : {};
   clearFile();
 
@@ -4869,6 +4974,7 @@ async function start() {
       return toast(err.message);
     }
   }
+  renderHistoryStatus();
   if (!state.workspace.ready) return showUnbuilt();
   if (state.workspace.project) rememberFolder(state.workspace.project);
   await loadOverview();

@@ -2,10 +2,10 @@
 
 import re
 import shlex
-import stat
 from pathlib import Path
 
 from ..model import Edit
+from .paths import resolved, special_file
 
 WORD = r"""(?:'[^'\n]*'|"[^"\n]*"|[^\s<>&;|'"()]+)"""
 DOC = re.compile(r"""<<(?P<tabs>-?)[ \t]*(?P<quote>['"]?)(?P<tag>[\w.-]+)(?P=quote)(?=\s|[;>]|$)""")
@@ -25,11 +25,58 @@ ECHO_WRITE = re.compile(
 MKDIR_PREFIX = re.compile(rf"[ \t\n]*mkdir[ \t]+-p[ \t]+({WORD})[ \t]*&&[ \t]*")
 CD = re.compile(rf"cd\s+(?:--\s+)?({WORD})")
 CONTROL = re.compile(
-    r"(?:^|[;&|]\s*)(?:if|for|while|until|case|function|alias|eval|source|exec|exit|return|read|trap|set|pushd|popd|setopt|unsetopt|\.)(?:\s|$)|^\s*[({]|\w+\s*\(\s*\)"
+    r"(?:^|[;&|]\s*)(?:if|for|while|until|case|function|alias|eval|source|exec|exit|return|read|trap|set|pushd|popd|setopt|unsetopt|\.)(?:\s|$)|^\s*[({]|(?<!\w)\w+\s*\(\s*\)"
 )
-SCRIPT = re.compile(
-    r"\b(?:write_text|write_bytes|writeFileSync|writeFile|writelines)\s*\(|\bopen\([^\n)]*,\s*['\"][wax]"
-)
+SCRIPT_METHOD = re.compile(r"\b(?:write_text|write_bytes|writeFileSync|writeFile|writelines)\s*\(")
+SCRIPT_OPEN = re.compile(r"\bopen\(")
+OPEN_MODE_OR_END = re.compile(r"""(?P<mode>,\s*['"][wax])|[)\n]""")
+HEADER_SEPARATORS = re.compile(r";|&&")
+QUOTES = re.compile("""['"]""")
+DOUBLE_QUOTE_END = re.compile(r'(?<!\\)(?:\\\\)*(?:"|\\(?=\n))')
+
+
+def script_write(text):
+    if SCRIPT_METHOD.search(text):
+        return True
+    pos = 0
+    while opening := SCRIPT_OPEN.search(text, pos):
+        # A later open() within the same run cannot reach a mode the first
+        # opening could not already match. A comma's whitespace may cross lines.
+        mode_or_end = OPEN_MODE_OR_END.search(text, opening.end())
+        if mode_or_end is None:
+            break
+        if mode_or_end.lastgroup == "mode":
+            return True
+        pos = mode_or_end.end()
+    return False
+
+
+def mask_quoted(text):
+    """Replace complete quoted arguments, including double-quoted escapes."""
+    pieces = []
+    pos = copied = failed_until = 0
+    while quote := QUOTES.search(text, pos):
+        pos = quote.end()
+        if quote[0] == "'":
+            end = text.find("'", pos) + 1
+        else:
+            if pos <= failed_until:
+                continue
+            closing = DOUBLE_QUOTE_END.search(text, pos)
+            if closing is None or text[closing.end() - 1] != '"':
+                # Starting at an escaped quote before the same invalid newline
+                # or EOF cannot make the double-quoted match succeed.
+                failed_until = closing.end() if closing else len(text)
+                continue
+            end = closing.end()
+        if end:
+            pieces.extend((text[copied:quote.start()], "ARG"))
+            pos = copied = end
+    return "".join((*pieces, text[copied:])) if pieces else text
+
+
+def split_headers(header):
+    return [part.strip() for part in HEADER_SEPARATORS.split(header)]
 
 
 def literal_path(token, cwd):
@@ -45,18 +92,9 @@ def literal_path(token, cwd):
     if not path.is_absolute() and not cwd:
         return None
     try:
-        return str((Path(cwd or "/") / path).resolve())
+        return resolved(Path(cwd or "/") / path)
     except (OSError, RuntimeError):
         return None
-
-
-def special_file(path):
-    try:
-        return not stat.S_ISREG(Path(path).stat().st_mode)
-    except FileNotFoundError:
-        return path.startswith(("/dev/", "/proc/", "/sys/"))
-    except OSError:
-        return True
 
 
 def shell_status(status, diagnostic):
@@ -81,9 +119,12 @@ def shell_commands(command):
         header = raw.strip()
         if not header or header.startswith("#"):
             continue
-        docs = list(DOC.finditer(header))
+        docs = list(DOC.finditer(header)) if "<<" in header else []
+        if not docs:
+            yield header, "", True, False
+            continue
         # Shells read multiple heredocs on a command line from left to right.
-        parts = re.split(r"\s*(?:;|&&)\s*", header)
+        parts = split_headers(header)
         split = len(parts) == len(docs) and all(
             any(p.fullmatch(part) for p in HEADERS) for part in parts
         )
@@ -104,6 +145,14 @@ def shell_commands(command):
             yield header, body, closed, bool(docs)
 
 
+def balanced(header):
+    try:
+        shlex.split(header, comments=True)
+    except ValueError:
+        return False
+    return True
+
+
 def shell_edits(
     command, cwd, status, counts, *, session, key, seq, ts, prompt, model, effort, tool,
     standalone=False,
@@ -112,6 +161,9 @@ def shell_edits(
         return []
     edits = []
     safe = True
+    # Quote balance only matters once a later line is a write, so it is checked
+    # then. shlex reads a character at a time, and agents run very long commands.
+    unchecked = []
     unknown_directory = False
     echo = ECHO_WRITE.fullmatch(command)
     commands = [(command.strip(), "", True, False)] if echo else shell_commands(command)
@@ -150,6 +202,9 @@ def shell_edits(
         match = echo or next((m for pattern in HEADERS if (m := pattern.fullmatch(header))), None)
         candidate = bool(re.search(r"(?:^|[;&|]\s*)(?:cat|tee)\s", header) and "<<" in header)
         if match:
+            if safe and unchecked:
+                safe = all(map(balanced, unchecked))
+                unchecked.clear()
             path = literal_path(match["path"], cwd)
             reason = None
             if not safe:
@@ -203,12 +258,12 @@ def shell_edits(
             counts["shell_rejected_unsupported_header"] += 1
         else:
             # A search pattern or code string can itself contain ">" or "sed -i".
-            words = re.sub(r"""'[^']*'|"(?:\\.|[^"\\])*" """.strip(), "ARG", header)
+            words = mask_quoted(header)
             if re.search(r"(?:^|[;&|]\s*)(?:cp|mv)\s", words):
                 counts["shell_opaque_copy_move"] += 1
             if re.search(r"(?:^|[;&|]\s*)sed\s+(?:-\w+\s+)*-[A-Za-z]*i(?:\s|$|[.'])", words):
                 counts["shell_opaque_sed"] += 1
-            if re.search(r"(?:^|[;&|]\s*)(?:python[.\d]*|node|ruby)\s", header) and SCRIPT.search(
+            if re.search(r"(?:^|[;&|]\s*)(?:python[.\d]*|node|ruby)\s", header) and script_write(
                 header + "\n" + body
             ):
                 counts["shell_opaque_script"] += 1
@@ -220,10 +275,8 @@ def shell_edits(
             safe = False
         if re.search(r"(?:\\|&&|\|\||\||\()$", header) or (not has_doc and "<<" in header):
             safe = False
-        try:
-            shlex.split(header, comments=True)
-        except ValueError:
-            safe = False
+        if safe:
+            unchecked.append(header)
         if re.search(r"(?:[;&|]\s*|^\s*)(?:cd|pushd|popd)\b", header):
             cwd = None
             unknown_directory = True

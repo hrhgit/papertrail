@@ -329,18 +329,29 @@ def test_macos_picker_stays_above_other_windows():
     assert "NSModalPanelWindowLevel" in web.PICK_SCRIPT and "orderFrontRegardless" in web.PICK_SCRIPT
 
 
-def held_build(monkeypatch):
-    """Make the next build wait at its start until the returned event is set."""
-    from papertrail import web
+def held_build(monkeypatch, phase):
+    """Hold the selected pass before it reads any files."""
+    from papertrail.sources import SourcePlan
 
-    release, real = threading.Event(), web.load_sources
+    arrived, release = threading.Event(), threading.Event()
+    real = SourcePlan.load
 
-    def waiting(roots, progress=None):
-        release.wait(10)
-        return real(roots, progress)
+    def waiting(self, progress=None, files=None):
+        if progress.phase == phase and not arrived.is_set():
+            arrived.set()
+            assert release.wait(10)
+        return real(self, progress, files)
 
-    monkeypatch.setattr(web, "load_sources", waiting)
-    return release
+    monkeypatch.setattr(SourcePlan, "load", waiting)
+    return arrived, release
+
+
+def preview_roots(tmp_path):
+    shutil.copytree(FIXTURE, tmp_path / "fixtures")
+    base = tmp_path / "fixtures"
+    (base / "logs/other.jsonl").write_bytes(b"{}\n" * 50_000)
+    roots = {"claude-code": base / "logs", "codex": base / "codex-sessions"}
+    return base / "project", roots
 
 
 def finished(reader, seconds=30):
@@ -354,17 +365,18 @@ def finished(reader, seconds=30):
 
 
 def test_background_build_reports_progress(tmp_path, monkeypatch):
-    project = (FIXTURE / "project").resolve()
-    roots = {"claude-code": FIXTURE / "logs", "codex": FIXTURE / "codex-sessions"}
+    project, roots = preview_roots(tmp_path)
+    greeting = project / "greeting.py"
     reader = Reader(tmp_path / "graph.rl", project)
     assert reader.build_status() == {"running": False, "stage": None}
-    release = held_build(monkeypatch)
+    arrived, release = held_build(monkeypatch, "quick")
     status = reader.start_build(project, roots=roots)
-    assert status["running"] and status["stage"] == "find" and status["error"] is None
+    assert arrived.wait(10)
+    assert status["running"] and status["phase"] == "quick" and status["error"] is None
     ws = reader.workspace()
     assert ws["building"] and not ws["ready"]
     # While it runs, files open as plain text and nothing switches folders.
-    assert reader.file(str(GREETING))["tracks"] == []
+    assert reader.file(str(greeting))["tracks"] == []
     with pytest.raises(ValueError, match="still building"):
         reader.call("overview")
     with pytest.raises(ValueError, match="Wait"):
@@ -375,7 +387,7 @@ def test_background_build_reports_progress(tmp_path, monkeypatch):
     assert reader.start_build(project, roots=roots)["running"] and reader.job is job
     release.set()
     status = finished(reader)
-    assert status["stage"] == "done" and status["fraction"] == 1.0
+    assert status["phase"] == "done" and status["complete"] and status["fraction"] == 1.0
     assert [s["name"] for s in status["sources"]] == ["claude-code", "codex"]
     for source in status["sources"]:
         assert source["files"] and source["read_files"] == source["files"]
@@ -385,20 +397,20 @@ def test_background_build_reports_progress(tmp_path, monkeypatch):
     assert result["ready"] and not result["building"] and result["sessions"] == status["sessions_kept"]
     assert Path(result["store"]) == tmp_path / "graph.rl"
     assert reader.call("overview")["stats"]["sessions"] >= 3
-    assert reader.file(str(GREETING))["tracks"]
+    assert reader.file(str(greeting))["tracks"]
     reader.close()
 
 
 def test_background_build_failure_is_reported(tmp_path, monkeypatch):
-    from papertrail import web
+    from papertrail import ingest
 
     (tmp_path / "project").mkdir()
     reader = Reader(project=tmp_path / "project")
 
-    def broken(store, sessions, stage=None):
+    def broken(store, sessions, **kwargs):
         raise ValueError("Disk said no.")
 
-    monkeypatch.setattr(web, "build", broken)
+    monkeypatch.setattr(ingest, "build", broken)
     reader.start_build(tmp_path / "project", roots={"claude-code": FIXTURE / "logs"})
     status = finished(reader)
     assert status["stage"] == "failed" and status["error"] == "Disk said no." and "result" not in status
@@ -409,13 +421,54 @@ def test_background_build_failure_is_reported(tmp_path, monkeypatch):
 def test_closing_the_reader_stops_a_running_build(tmp_path, monkeypatch):
     (tmp_path / "project").mkdir()
     reader = Reader(project=tmp_path / "project")
-    release = held_build(monkeypatch)
+    arrived, release = held_build(monkeypatch, "full")
     reader.start_build(tmp_path / "project", roots={"claude-code": FIXTURE / "logs"})
+    assert arrived.wait(10)
     threading.Timer(0.1, release.set).start()
     reader.close()
-    assert not reader.building and reader.build_status()["error"] == "The build was stopped."
+    assert not reader.building and reader.build_status()["phase"] == "cancelled"
     store_dir = tmp_path / "project/.papertrail"
-    assert not (store_dir / "graph.rl").exists() and not list(store_dir.glob(".papertrail-build-*"))
+    with ReaderQueries(store_dir / "graph.rl") as graph:
+        assert not graph.complete
+    assert not list(store_dir.glob(".papertrail-build-*"))
+
+
+@pytest.mark.parametrize("action", ["finish", "switch", "rebuild"])
+def test_reader_uses_quick_graph_during_full_pass(tmp_path, monkeypatch, action):
+    project, roots = preview_roots(tmp_path)
+    arrived, release = held_build(monkeypatch, "full")
+    reader = Reader(project=project)
+    try:
+        reader.start_build(project, roots=roots)
+        assert arrived.wait(10)
+        first = reader.job
+        status = first.status()
+        assert status["running"] and status["phase"] == "full"
+        assert status["ready"] and not status["complete"]
+        assert status["sessions_read"] is None and not status["sources"]
+        assert reader.workspace()["ready"]
+        assert not reader.overview()["complete"]
+        assert reader.file(project / "greeting.py")["tracks"]
+        preview_version = reader.graph_version
+        if action == "switch":
+            assert not reader.open(tmp_path)["building"]
+        elif action == "rebuild":
+            reader.start_build(project, roots=roots)
+            assert reader.job is not first
+        release.set()
+        if action != "finish":
+            assert first.ended.wait(10) and first.status()["phase"] == "cancelled"
+        if action == "switch":
+            assert not reader.open(project)["complete"]
+            assert not reader.overview()["complete"]
+            reader.start_build(project)
+        assert finished(reader)["complete"]
+        assert reader.overview()["complete"]
+        assert reader.graph_version != preview_version
+        assert not list((project / ".papertrail").glob(".papertrail-build-*"))
+    finally:
+        release.set()
+        reader.close()
 
 
 def test_load_sources_reports_every_file():
@@ -712,3 +765,31 @@ def test_span_lists_each_instruction_behind_a_run_of_lines(store, server):
     query = urllib.parse.urlencode({"path": GREETING, "start": 2, "end": 2})
     status, _, body = get(server + "/api/span?" + query)
     assert status == 200 and [r["session"] for r in json.loads(body)["rows"]][:2] == ["cedar", "birch"]
+
+
+def test_reader_answers_from_complete_graph_throughout_rebuild(tmp_path, monkeypatch):
+    from papertrail.graph import select
+
+    project, roots = preview_roots(tmp_path)
+    path = project / ".papertrail/graph.rl"
+    build(path, select(list(ClaudeCodeSource().sessions(roots["claude-code"])), project))
+    reader = Reader(path, project)
+    arrived, release = held_build(monkeypatch, "full")
+    greeting = project / "greeting.py"
+    try:
+        before = reader.overview()
+        original = reader.file(greeting)["tracks"]
+        version = reader.graph_version
+        reader.start_build(project, roots=roots)
+        assert arrived.wait(10)
+        status = reader.build_status()
+        assert status["running"] and status["phase"] == "full" and status["complete"]
+        assert reader.overview() == before and reader.file(greeting)["tracks"] == original
+        assert reader.graph_version == version
+        release.set()
+        assert finished(reader)["complete"]
+        assert reader.overview()["complete"]
+        assert reader.graph_version != version
+    finally:
+        release.set()
+        reader.close()

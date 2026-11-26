@@ -171,8 +171,12 @@ class Queries:
         self.db = relate.connect(str(store), read_only=True)
         # Resolve the portable folder using this connection's own snapshot.
         try:
-            rows = self.db.execute("MATCH (m:PaperTrail) RETURN m.portable AS portable").data()
-            relative = rows[0]["portable"] if rows else None
+            rows = self.db.execute(
+                "MATCH (m:PaperTrail) RETURN m.portable AS portable, m.complete AS complete"
+            ).data()
+            meta = rows[0] if rows else {}
+            self.complete = meta.get("complete") is not False
+            relative = meta.get("portable")
             self.root = str((store.parent / relative).resolve()) if relative else None
         except BaseException:
             self.db.close()
@@ -442,7 +446,7 @@ event.id AS id, instruction.id AS prompt_id, instruction.text AS instruction, fi
     def stats(self, limit=None):
         self._begin()
         counts = self._stats()
-        return {"rows": [counts], "truncated": False, "cypher": list(self.statements)}
+        return {"rows": [counts], "complete": self.complete, "truncated": False, "cypher": list(self.statements)}
 
     def _stats(self):
         counts = self._run("MATCH ()-[r]->() RETURN count(r) AS relationships")[0]

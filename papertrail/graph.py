@@ -3,7 +3,7 @@
 import os
 import pickle
 from collections import defaultdict
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 from dataclasses import asdict, replace
 from itertools import pairwise
 from pathlib import Path
@@ -102,7 +102,7 @@ def portable_root(store):
     return (store.parent / relative).resolve() if relative else None
 
 
-def build(store, sessions, stage=None, portable=None):
+def build(store, sessions, stage=None, portable=None, *, complete=True, publish=None):
     """Write the graph. `stage`, if given, hears ("replay") and ("write", files=N).
 
     `portable` names a folder that holds the project, its logs and the store. Its path
@@ -120,7 +120,7 @@ def build(store, sessions, stage=None, portable=None):
     if store.parent.name == ".papertrail" and not ignore.exists():
         ignore.write_text("*\n")
     store = store.resolve()
-    meta = {"version": 1}
+    meta = {"version": 1, "complete": complete}
     base = str(Path(portable).resolve()) if portable else None
     if base:
         meta["portable"] = os.path.relpath(base, store.parent)
@@ -156,23 +156,28 @@ def build(store, sessions, stage=None, portable=None):
                 )
                 for batch in rows.batches():
                     write_rows(db, query, batch, kind)
-        try:
-            os.link(staged, store)
-        except FileExistsError:
-            # Pin the previous generation read-only while checking its identity.
-            # An active Relate writer prevents opening it. Existing readers
-            # keep their old inode until they reopen the published generation.
-            with relate.connect(str(store), read_only=True) as previous:
-                if (
-                    previous.execute("MATCH (n) RETURN count(n) AS n").data()[0]["n"]
-                    and not previous.execute(
-                        "MATCH (:PaperTrail {version:1}) RETURN 1 AS ok"
-                    ).data()
-                ):
-                    raise ValueError(
-                        "Existing store belongs to another application. Choose a fresh --store."
-                    )
-                os.replace(staged, store)
+        with publish(complete) if publish else nullcontext():
+            publish_store(staged, store)
+
+
+def publish_store(staged, store):
+    try:
+        os.link(staged, store)
+    except FileExistsError:
+        # Pin the previous generation read-only while checking its identity.
+        # An active Relate writer prevents opening it. Existing readers
+        # keep their old inode until they reopen the published generation.
+        with relate.connect(str(store), read_only=True) as previous:
+            if (
+                previous.execute("MATCH (n) RETURN count(n) AS n").data()[0]["n"]
+                and not previous.execute(
+                    "MATCH (:PaperTrail {version:1}) RETURN 1 AS ok"
+                ).data()
+            ):
+                raise ValueError(
+                    "Existing store belongs to another application. Choose a fresh --store."
+                )
+            os.replace(staged, store)
 
 
 def collect_rows(sessions, nodes, edges, stage):

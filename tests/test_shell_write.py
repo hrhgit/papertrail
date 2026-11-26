@@ -89,6 +89,7 @@ def test_echo_without_literal_write_evidence(tmp_path, command):
         ("cd $DIR\ncat > p <<D\nx\nD", "unknown_cwd"),
         ("cat > f <<'D'\nx", "unclosed_heredoc"),
         ("if false; then\ncat > x <<D\nx\nD\nfi", "shell_context"),
+        ("echo 'open\ncat > x <<D\nx\nD", "shell_context"),
     ],
 )
 def test_rejections(tmp_path, cmd, reason):
@@ -463,3 +464,74 @@ def test_consecutive_appends_share_eof_witness(tmp_path):
     f = replay(str(path), edits)
     assert f.unapplied == 0
     assert [h.edit for h in f.hunks if h.kind == "agent"] == [e.id for e in edits]
+
+
+def test_long_command_without_a_write_skips_quote_check(tmp_path, monkeypatch):
+    import papertrail.sources.shell_write as shell_write
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("quote balance checked without a later write")
+
+    monkeypatch.setattr(shell_write.shlex, "split", refuse)
+    command = "python3 -c 'print(1)' " + "x" * 200_000 + "\nls -la\n"
+    edits, counts = parse(command, tmp_path)
+    assert edits == []
+
+
+@pytest.mark.parametrize("shape", ["word", "spaces", "opens", "escaped_quotes"])
+def test_long_line_without_a_write_finishes_quickly(tmp_path, shape):
+    from time import thread_time
+
+    command = {
+        "word": "python3 -c 'print(1)' " + "x" * 200_000 + "\nls -la\n",
+        "spaces": "python3 " + " " * 200_000 + " x",
+        "opens": "python3 " + "open(" * 40_000,
+        "escaped_quotes": 'echo "' + r'\"' * 100_000,
+    }[shape]
+    # Measure the parser thread without including time it spends descheduled.
+    start = thread_time()
+    edits, _ = parse(command, tmp_path)
+    elapsed = thread_time() - start
+    assert not edits
+    assert elapsed < 0.8
+
+
+def test_quotes_and_script_modes_at_line_boundaries():
+    from papertrail.sources.shell_write import mask_quoted, script_write
+
+    incomplete = '"' + r'\"' + "\\\n"
+    assert mask_quoted(incomplete + "'one' \"two\"") == incomplete + "ARG ARG"
+    assert mask_quoted('"a' + r'\\' + '"') == "ARG"
+    assert script_write('open(first) + open(second,\n "w")')
+    assert not script_write('open(first), "w"')
+    assert not script_write('open(first\n second, "w"')
+
+
+def test_opaque_categories_keep_heredoc_and_sed_matches():
+    from papertrail.sources.codex_patch import opaque_categories
+
+    assert list(opaque_categories("python3 <<DOC > a")) == ["redirect"]
+    assert list(opaque_categories("python3 <<DOC > a\n")) == []
+    assert list(opaque_categories("python3 <<\nDOC > a\n")) == []
+    assert list(opaque_categories("sed -x/sed -i.bak a")) == ["sed_inplace"]
+    assert list(opaque_categories("sed -x/sed -e a")) == []
+
+
+def test_git_contents_accept_both_readings_of_an_option():
+    from papertrail.sources.claude import git_content
+
+    assert git_content("git --work-tree checkout")
+    assert git_content("git --work-tree checkout -C 'a directory' restore")
+    assert git_content("echo 'git --git-dir=other checkout'")
+    assert not git_content("git " + "--work-tree " * 60 + "status")
+
+
+def test_read_only_shortcut_keeps_quoted_command_names_and_checks_arguments():
+    from papertrail.sources.claude import read_only
+
+    assert read_only("'ls' -la")
+    assert read_only('"/usr/bin/ls" -la')
+    assert read_only("l's' -la")
+    assert not read_only("python3 -c 'pass'")
+    assert not read_only("ls 'unfinished")
+    assert not read_only("l's'x -la")
