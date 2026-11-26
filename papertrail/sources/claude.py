@@ -133,9 +133,11 @@ def command_cwd(command, cwd):
 # Code that starts another process. A script body mentioning an agent name is only
 # another writer when it can run something.
 LAUNCHES = re.compile(
-    r"\b(?:subprocess|os\.system|os\.exec|os\.spawn|popen|execSync|spawnSync|child_process"
-    r"|system\s*\(|exec\s*\(|`)"
+    r"`|%x|\b(?:subprocess|os\.system|os\.exec|os\.spawn|popen|execSync|spawnSync"
+    r"|child_process|Open3|spawn|qx|system|exec)\b"
 )
+# The shell part runs a script file, which the heredoc body may have written.
+RUNS_SCRIPT = re.compile(r"(?:^|[\s;&|(])(?:(?:ba|z|da|k)?sh|source|\.)[ \t]+[^\s<-]|(?:^|[\s;&|(])\./\S")
 
 
 # A heredoc fed straight to one of these is a script, not shell. Any other heredoc
@@ -160,8 +162,11 @@ def other_agent(command):
                 bodies.append("\n".join(body))
             else:
                 shell.extend(body)
-    if OTHER_AGENT.search("\n".join(shell)):
+    shell = "\n".join(shell)
+    if OTHER_AGENT.search(shell):
         return True
+    if RUNS_SCRIPT.search(shell):
+        return any(OTHER_AGENT.search(b) for b in bodies)
     return any(OTHER_AGENT.search(b) and LAUNCHES.search(b) for b in bodies)
 
 

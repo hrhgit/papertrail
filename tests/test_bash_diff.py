@@ -283,6 +283,10 @@ def test_agent_name_in_script_text_is_not_another_writer(tmp_path):
         "python3 - <<'PY'\nimport subprocess\nsubprocess.run(['codex', 'exec', 'notes.txt'])\nPY",
         "bash <<'SH'\ncodex exec 'fix notes.txt'\nSH",
         "cat <<'SH' > run.sh && bash run.sh\nclaude -p 'fix notes.txt'\nSH",
+        "ruby <<'RB'\n`codex exec notes.txt`\nRB",
+        "perl <<'PL'\nqx(codex exec notes.txt);\nPL",
+        "python3 - <<'PY' && bash run.sh\nopen('run.sh', 'w').write('codex exec notes.txt')\nPY",
+        "python3 - <<'PY'\nopen('run.sh', 'w').write('codex exec notes.txt')\nPY\n./run.sh",
     ],
 )
 def test_script_that_launches_an_agent_is_another_writer(tmp_path, command):
