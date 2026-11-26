@@ -1,6 +1,7 @@
 """Read transcripts locally. Diagnostics contain category counts only."""
 
 import json
+import os
 import re
 import shlex
 from collections import Counter
@@ -8,10 +9,121 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from ..model import Edit, Prompt, Read, Replacement, Session
-from .shell_write import shell_edits, shell_status
+from .shell_write import WORD, literal_path, shell_edits, shell_status
 
 # Report bytes read within a large log this often, so progress keeps moving.
 READ_CHUNK = 1 << 22
+
+# A Bash result's `bashEditDiff` lists what the command changed on disk. It is not
+# this session's writing when the command ran another agent (that agent's own log
+# records the edit) or moved existing content in with git.
+OTHER_AGENT = re.compile(
+    r"(?:^|[\s;&|(`/'\"])(?:codex|claude|kimi|dsh|aider|gemini|cursor-agent|opencode"
+    r"|ai_run\.py|codex_app\.py)(?=$|[\s;&|<>)`'\"])"
+)
+GIT_OPTIONS = rf"(?:-[Cc][ \t]*{WORD}|--(?:git-dir|work-tree|namespace)(?:=|[ \t]+){WORD}|--[\w-]+)"
+GIT_CONTENT = re.compile(
+    rf"(?:^|[\s;&|(`/'\"])git['\"]?[ \t]+(?:{GIT_OPTIONS}[ \t]+)*"
+    r"(?:checkout|switch|merge|pull|rebase|stash|reset|restore|cherry-pick|revert|am|apply"
+    r"|clone|worktree|rm|mv|clean|submodule|checkout-index|read-tree)\b"
+)
+
+# Commands that only read. A diff reported for one of these shows changes made by
+# someone else while it ran, not by the command.
+READ_ONLY = {
+    "cat", "grep", "egrep", "head", "tail", "wc", "ls", "nl", "stat", "diff",
+    "cmp", "echo", "printf", "true", "pwd", "which", "jq", "cut",
+    "column", "od", "hexdump", "shasum", "md5", "du", "sleep",
+}
+READ_ONLY_GIT = {"diff", "show", "log", "status", "blame", "grep", "ls-files", "rev-parse"}
+HARMLESS_REDIRECT = re.compile(r"(?:1>&2|2>&1|\d?>[ \t]*/dev/null)(?=$|[ \t\n;|])")
+SEGMENTS = re.compile(r"&&|\|\||[;|\n]")
+SED_PRINT = re.compile(r"[0-9]+(?:,[0-9]+)?p")
+CHANGES_DIRECTORY = re.compile(r"(?:^|[\n;&|'\"])\s*(?:cd|pushd|popd)(?=\s|$)")
+LEADING_CD = re.compile(rf"\s*cd[ \t]+(?:--[ \t]+)?({WORD})[ \t]*(?:&&|;|\n)")
+
+
+def read_only(command):
+    """Whether every part of a command only reads. Unsure forms are not read-only."""
+    rest = HARMLESS_REDIRECT.sub(" ", command)
+    if any(c in rest.replace("&&", "") for c in "><`$(&"):
+        return False
+    for segment in SEGMENTS.split(rest):
+        try:
+            words = shlex.split(segment)
+        except ValueError:
+            return False
+        if not words or words[0] == "cd":
+            continue
+        name, *args = words
+        executable = Path(name)
+        if executable.parent in (Path("/bin"), Path("/usr/bin")):
+            name = executable.name
+        if name == "git":
+            while args:
+                if args[0] == "-C" and len(args) > 1:
+                    args = args[2:]
+                elif args[0] in ("--no-pager", "-P"):
+                    args = args[1:]
+                else:
+                    break
+            if not args or args[0] not in READ_ONLY_GIT:
+                return False
+            if any(
+                arg.startswith(("--out", "--ext", "--textconv", "--exec", "-O"))
+                for arg in args[1:]
+            ):
+                return False
+        elif name == "sed":
+            if args[:1] != ["-n"] or len(args) < 3 or not SED_PRINT.fullmatch(args[1]):
+                return False
+            if any(arg.startswith("-") for arg in args[2:]):
+                return False
+        elif name == "rg":
+            if any(arg.startswith("--pre") for arg in args):
+                return False
+        elif name == "find":
+            if any(arg.startswith(("-exec", "-ok", "-fprint", "-fls", "-delete")) for arg in args):
+                return False
+        elif name in ("sort", "tree", "file"):
+            # These can write with options such as sort -o and file -C.
+            if any(arg.startswith("-") for arg in args):
+                return False
+        elif name in ("uniq", "xxd"):
+            if len(args) > 1 or any(arg.startswith("-") for arg in args):
+                return False
+        elif name not in READ_ONLY:
+            return False
+    return True
+
+
+def names(command, path, cwd):
+    """Match a complete path, including its directory if the command uses one."""
+    spellings = [str(path)]
+    if cwd:
+        relative = os.path.relpath(path, cwd)
+        spellings.extend((relative, "./" + relative))
+    for spelling in spellings:
+        if re.search(rf"(?<![\w./~-]){re.escape(spelling)}(?![\w./~-])", command):
+            return True
+    return False
+
+
+def command_cwd(command, cwd):
+    # Bash's result has already passed the shell diagnostic check, including
+    # cd failures. For a simple leading cd, resolve mentions in that directory.
+    if (cd := LEADING_CD.match(command)) and not CHANGES_DIRECTORY.search(command[cd.end() :]):
+        return literal_path(cd[1], cwd)
+    return None if CHANGES_DIRECTORY.search(command) else cwd
+
+
+def hunk_counts_match(hunk):
+    rows = hunk.get("lines")
+    if not isinstance(rows, list) or not all(isinstance(r, str) for r in rows):
+        return False
+    old = sum(not r.startswith("+") and not r.startswith("\\") for r in rows)
+    new = sum(not r.startswith("-") and not r.startswith("\\") for r in rows)
+    return (old, new) == (hunk.get("oldLines"), hunk.get("newLines"))
 
 
 def timestamp(value):
@@ -287,6 +399,10 @@ class ClaudeCodeSource:
                     session.model = model
                 effort = record.get("effort") or record.get("perTurnEffort")
                 effort = effort if isinstance(effort, str) else ""
+                payload = record.get("toolUseResult")
+                shared_result = payload is not None and sum(
+                    b.get("type") == "tool_result" for b in blocks
+                ) > 1
                 for block in blocks:
                     if block.get("type") == "tool_use":
                         if not isinstance(block.get("id"), str):
@@ -310,7 +426,10 @@ class ClaudeCodeSource:
                         call = pending.pop(block.get("tool_use_id"), None)
                         if call is None:
                             continue
-                        child_copy = side and record.get("toolUseResult") is None
+                        if shared_result:
+                            self.failures["ambiguous_shared_result"] += 1
+                            continue
+                        child_copy = side and payload is None
                         native = (
                             child_copy
                             and record.get("agentId") == path.stem.removeprefix("agent-")
@@ -321,21 +440,20 @@ class ClaudeCodeSource:
                             if not isinstance(args, dict):
                                 self.failures["incomplete_Bash"] += 1
                                 continue
-                            payload = record.get("toolUseResult") or {}
+                            receipt = payload or {}
                             status = "failed" if block.get("is_error") else "success"
-                            if isinstance(payload, dict) and (
-                                payload.get("backgroundTaskId")
-                                or payload.get("interrupted")
-                                or args.get("run_in_background")
+                            if args.get("run_in_background") or (
+                                isinstance(receipt, dict)
+                                and (receipt.get("backgroundTaskId") or receipt.get("interrupted"))
                             ):
                                 status = "unconfirmed"
-                            if isinstance(payload, dict):
+                            if isinstance(receipt, dict):
                                 status = shell_status(
                                     status,
-                                    payload.get("stderr") or result_text(block.get("content")),
+                                    receipt.get("stderr") or result_text(block.get("content")),
                                 )
-                            if isinstance(payload, dict) and payload.get("exitCode", 0) != 0:
-                                status = "failed"
+                                if receipt.get("exitCode", 0) != 0:
+                                    status = "failed"
                             edits = shell_edits(
                                 args.get("command"),
                                 cwd,
@@ -354,17 +472,20 @@ class ClaudeCodeSource:
                                 for edit in edits:
                                     self.retain_edit(session, edit, child_copy, native)
                                 continue
+                            if (
+                                status == "success"
+                                and isinstance(receipt, dict)
+                                and receipt.get("bashEditDiff")
+                            ):
+                                edits = self.bash_diff_edits(session, call, receipt, ts)
+                                if edits:
+                                    for edit in edits:
+                                        self.retain_edit(session, edit, child_copy, native)
+                                    continue
                         if block.get("is_error"):
                             self.skipped["failed_" + ("read" if call[1] == "Read" else "tool")] += 1
                             continue
                         try:
-                            payload = record.get("toolUseResult")
-                            if (
-                                payload is not None
-                                and sum(b.get("type") == "tool_result" for b in blocks) > 1
-                            ):
-                                self.failures["ambiguous_shared_result"] += 1
-                                continue
                             text = result_text(block.get("content"))
                             if call[1] == "Read":
                                 snapshot = read_snapshot(ts, call, payload, text)
@@ -395,6 +516,64 @@ class ClaudeCodeSource:
                 self.failures["invalid_title"] += 1
         session.title = session.title or slug
         return session
+
+    def bash_diff_edits(self, session, call, result, ts):
+        """Edits from the diff Claude Code records for a Bash command. A file counts
+        only when the command names it, and the command neither runs another agent nor
+        brings content in with git. Each hunk is a numbered patch, so replay checks
+        its context against what the file held at that point."""
+        seq, _, args, prompt, model, tool_id, cwd, *rest = call
+        diff = result.get("bashEditDiff")
+        if not isinstance(diff, dict) or not isinstance(diff.get("files"), list):
+            return []
+        command = args.get("command") if isinstance(args.get("command"), str) else ""
+        if OTHER_AGENT.search(command) or GIT_CONTENT.search(command):
+            self.skipped["bash_diff_other_writer"] += len(diff["files"])
+            return []
+        if read_only(command):
+            self.skipped["bash_diff_read_only"] += len(diff["files"])
+            return []
+        named_from = command_cwd(command, cwd)
+        edits = []
+        for i, entry in enumerate(diff["files"]):
+            filename = entry.get("filePath") if isinstance(entry, dict) else None
+            hunks = entry.get("hunks") if isinstance(entry, dict) else None
+            if not isinstance(filename, str) or not filename or not isinstance(hunks, list):
+                self.failures["incomplete_bash_diff"] += 1
+                continue
+            path = Path(filename).expanduser()
+            if not path.is_absolute():
+                if not cwd:
+                    self.failures["relative_path_without_cwd"] += 1
+                    continue
+                path = Path(cwd) / path
+            if not names(command, path, named_from):
+                self.skipped["bash_diff_unnamed_file"] += 1
+                continue
+            if not hunks or not all(isinstance(h, dict) and hunk_counts_match(h) for h in hunks):
+                self.skipped["bash_diff_incomplete_hunks"] += 1
+                continue
+            try:
+                patch = unified(hunks)
+            except (KeyError, TypeError):
+                self.failures["incomplete_bash_diff"] += 1
+                continue
+            edits.append(
+                Edit(
+                    f"{session.id}:e:{tool_id}:d{i}",
+                    seq,
+                    ts,
+                    "Bash",
+                    str(path.resolve()),
+                    prompt,
+                    model or session.model,
+                    patch=patch,
+                    effort=rest[0] if rest else "",
+                    call_id=tool_id,
+                )
+            )
+        self.counts["bash_diff_edits"] += len(edits)
+        return edits
 
     def edit(self, session, ts, call, result, text=""):
         seq, name, args, prompt, model, tool_id, cwd, *rest = call

@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
+from ..logfile import ZstdUnavailable, compressed, log_stem, open_log
 from ..model import Edit, Prompt, Session
 from .codex_patch import (
     absolute,
@@ -23,7 +24,7 @@ from .codex_patch import (
     wrapper_patch,
 )
 from .claude import READ_CHUNK
-from .shell_write import shell_edits, shell_status
+from .shell_write import ECHO_WRITE, shell_edits, shell_status
 
 
 @dataclass(frozen=True)
@@ -134,6 +135,7 @@ class Rollout:
         self.launches = []
         self.event_commands = Counter()
         self.shell_results = []
+        self.runtime_shell = {}
         self.finished_shell_calls = set()
         self.seen = set()
         self.prompt_by_text = {}
@@ -356,6 +358,14 @@ class Rollout:
         call = self.owner(key, turn_id)
         if call:
             call.command_events += 1
+        origin = item.get("source")
+        if (
+            origin not in (None, "agent", "unified_exec_startup")
+            or item.get("plugin_id")
+            or item.get("script_path")
+        ):
+            self.source.skipped["non_agent_command_event"] += 1
+            return
         cmd = command_string(item.get("command"))
         context = call.turn if call else self.turns.get(turn_id, Turn("", "", "", None, turn_id))
         cwd = self.command_directory(item.get("cwd"), context.cwd)
@@ -370,28 +380,48 @@ class Rollout:
         if len(choices) == 1 and isinstance(choices[0].get("workdir", ""), str):
             receipt_cwd = self.command_directory(choices[0].get("workdir"), inputs[0].cwd)
         self.event_commands[outer, cmd, receipt_cwd] += 1
-        status = (
-            "success"
-            if item.get("exit_code") == 0 and item.get("status") == "completed"
-            else "failed"
-        )
+        exit_code = item.get("exit_code")
+        success = type(exit_code) is int and exit_code == 0 and item.get("status") == "completed"
+        status = "success" if success else "failed"
         static = inputs is None or any(
             a.get("cmd") == cmd for n, a in inputs[1] if n == "exec_command"
         )
-        if not static:
-            status = "js_expression"
         status = shell_status(status, item.get("aggregated_output"))
-        self.s.edits.extend(
-            self.write_command(
-                cmd,
-                cwd,
-                context,
-                key,
-                ts,
-                status,
-                call.name if call else "exec_command",
-            )
+        argv = item.get("command")
+        runtime_literal = (
+            not static
+            and not inputs[1]
+            and call is not None
+            and call.name == "exec"
+            and origin == "unified_exec_startup"
+            and status == "success"
+            and isinstance(argv, list)
+            and len(argv) == 3
+            and isinstance(argv[0], str)
+            and Path(argv[0]).parent in (Path("/bin"), Path("/usr/bin"), Path("/opt/homebrew/bin"))
+            and Path(argv[0]).name in {"bash", "sh", "zsh"}
+            and argv[1] in ("-c", "-lc")
+            and ("<<" in cmd or ECHO_WRITE.fullmatch(cmd))
+            and isinstance(item.get("cwd"), str)
+            and item["cwd"].startswith(("/", "file:"))
+            and cwd
         )
+        if runtime_literal:
+            # A completed native record supplies the actual command after
+            # JavaScript evaluation. Wait until we know how many it launched.
+            self.runtime_shell[outer] = (self.seq, cmd, cwd, context, key, ts)
+        else:
+            self.s.edits.extend(
+                self.write_command(
+                    cmd,
+                    cwd,
+                    context,
+                    key,
+                    ts,
+                    status if static else "js_expression",
+                    call.name if call else "exec_command",
+                )
+            )
         patch, cwd = shell_invocation(cmd, cwd)
         if not patch:
             self.command(cmd)
@@ -399,7 +429,6 @@ class Rollout:
         self.count["shell_patch_events"] += 1
         # Prefer FileChange if the execution also emitted one. Settle this
         # shell receipt at outer call completion, after all nested items.
-        success = item.get("exit_code") == 0 and item.get("status") == "completed"
         if not success:
             self.count["shell_patch_failed"] += 1
         if call:
@@ -416,7 +445,7 @@ class Rollout:
         self.count["fallback_file_receipts"] += len(changes)
         self.emit(changes, context, key, event, ts)
 
-    def write_command(self, cmd, cwd, turn, key, ts, status, tool):
+    def write_command(self, cmd, cwd, turn, key, ts, status, tool, *, standalone=False):
         edits = shell_edits(
             cmd,
             cwd,
@@ -430,6 +459,7 @@ class Rollout:
             model=turn.model,
             effort=turn.effort,
             tool=tool,
+            standalone=standalone,
         )
         return edits
 
@@ -514,7 +544,12 @@ class Rollout:
         if key in self.shell_inputs and key not in self.finished_shell_calls:
             self.finished_shell_calls.add(key)
             _turn, items = self.shell_inputs[key]
-            if any(n == "write_stdin" or (a.get("cmd") and "<<" in a["cmd"]) for n, a in items):
+            if any(
+                name == "write_stdin"
+                or isinstance(cmd := args.get("cmd"), str)
+                and ("<<" in cmd or ECHO_WRITE.fullmatch(cmd))
+                for name, args in items
+            ):
                 self.shell_results.append(
                     (
                         key,
@@ -591,6 +626,15 @@ class Rollout:
             self.count[status + "_nonliteral_marker"] += 1
 
     def finish(self):
+        for outer, (seq, cmd, cwd, turn, key, ts) in self.runtime_shell.items():
+            call = self.calls.get(outer) or self.closed.get(outer)
+            if call is None or call.command_events != 1 or call.events:
+                self.count["shell_rejected_runtime_ambiguous"] += 1
+                continue
+            self.seq = seq
+            edits = self.write_command(cmd, cwd, turn, key, ts, "success", "exec", standalone=True)
+            self.count["runtime_literal_edits"] += len(edits)
+            self.s.edits.extend(edits)
         for key, value, ts, seq, wrapped in self.shell_results:
             self.seq = seq
             self.shell_result(key, value, ts, wrapped)
@@ -719,24 +763,34 @@ class CodexSource:
         self.failures = Counter()
         self.skipped = Counter()
         self.tick = None
+        self.broken = set()
 
     def raw_lines(self, path):
         # Rollouts are append-only. Use the same byte boundary in the metadata
-        # pass, the parsing pass and the independent receipt audit.
-        remaining = self.log_sizes[path]
+        # pass, the parsing pass and the independent receipt audit. A compressed
+        # rollout is finished, so it is read to the end, and progress counts it
+        # when it is done rather than by decompressed bytes.
+        packed = compressed(path)
+        remaining = -1 if packed else self.log_sizes[path]
         unreported = 0
         try:
-            with path.open("rb") as stream:
+            with open_log(path) as stream:
                 while remaining and (line := stream.readline(remaining)):
-                    remaining -= len(line)
-                    if self.tick:
+                    remaining -= len(line) if remaining > 0 else 0
+                    if self.tick and not packed:
                         unreported += len(line)
                         if unreported >= READ_CHUNK:
                             self.tick(path, unreported)
                             unreported = 0
                     yield line
-        except OSError:
+        except ZstdUnavailable:
+            self.failures["compressed_rollout_without_zstd"] += 1
+        except Exception as error:  # OSError, or a decoder's own error type
+            if not packed and not isinstance(error, OSError):
+                raise
             self.failures["unreadable_rollout"] += 1
+            # What was read before the failure is a prefix, not the session.
+            self.broken.add(path)
 
     def records(self, path):
         for line in self.raw_lines(path):
@@ -766,12 +820,14 @@ class CodexSource:
         yield from sorted(unique.values(), key=lambda r: r.get("timestamp", ""))
 
     def log_files(self, root):
-        return sorted(Path(root).expanduser().resolve().rglob("rollout-*.jsonl"))
+        root = Path(root).expanduser().resolve()
+        return sorted([*root.rglob("rollout-*.jsonl"), *root.rglob("rollout-*.jsonl.zst")])
 
     def sessions(self, root, progress=None):
         batch, child_paths, launches = {}, {}, defaultdict(list)
         groups = defaultdict(list)
         self.log_sizes = {}
+        self.broken = set()
         for path in self.log_files(root):
             try:
                 self.log_sizes[path] = path.stat().st_size
@@ -788,7 +844,7 @@ class CodexSource:
         # Count bytes only in the full pass, not the metadata pass above.
         self.tick = progress
         for sid, paths in groups.items():
-            paths.sort(key=lambda p: not p.stem.endswith(sid))
+            paths.sort(key=lambda p: (not log_stem(p).endswith(sid), compressed(p)))
             self.counts["replica_files"] += len(paths) - 1
             run = None
             for seq, r in enumerate(self.merged(paths)):
@@ -836,6 +892,9 @@ class CodexSource:
                     RuntimeError,
                 ):
                     self.failures["malformed_record"] += 1
+            if run and any(path in self.broken for path in paths):
+                self.skipped["partial_rollout"] += 1
+                run = None
             if run:
                 run.finish()
                 batch[sid] = run.s
