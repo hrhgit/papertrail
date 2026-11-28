@@ -1724,7 +1724,8 @@ async function openFile(path, line = null, { keepFocus = true, keepPanel = false
   if (request !== nav.fileRequest) return;
   const current = refresh ? whereNow() : null;
   state.file = file;
-  state.scopeDir = null;
+  // A refresh of the open file keeps the folder the reader chose.
+  if (!refresh) state.scopeDir = null;
   if (!keepFocus) state.focus = null;
   addTab(file.path);
   ensureExpanded(file.path);
@@ -2436,6 +2437,7 @@ function selectGap(after, { open = false, scroll = false, panel } = {}) {
   if (!list) return;
   state.line = null;
   state.gap = after;
+  state.scopeDir = null;
   if (open && !isGapOpen(after)) toggleGap(after);
   markSelected();
   if (scroll) scrollToFileRow(after, true);
