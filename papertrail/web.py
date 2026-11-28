@@ -70,9 +70,11 @@ def store_for(folder):
 FILES = """
 MATCH (f:File)
 OPTIONAL MATCH (f)-[:HAS_RANGE]->(r:Range)-[:FROM]->(h:Hunk)
-WITH f, sum(CASE WHEN h.kind = 'agent' THEN r.end - r.start + 1 ELSE 0 END) AS agent_lines
+WITH f, sum(CASE WHEN h.kind = 'agent' THEN r.end - r.start + 1 ELSE 0 END) AS agent_lines,
+sum(CASE WHEN h.kind = 'inferred' THEN r.end - r.start + 1 ELSE 0 END) AS inferred_lines,
+sum(CASE WHEN h IS NULL THEN 0 ELSE r.end - r.start + 1 END) AS ranged_lines
 OPTIONAL MATCH (s:Session)-[:HAS_EDIT]->(e:Edit)-[:TOUCHED]->(f)
-RETURN f.path AS path, f.status AS status, f.lines AS lines, agent_lines,
+RETURN f.path AS path, f.status AS status, f.lines AS lines, agent_lines, inferred_lines, ranged_lines,
 count(DISTINCT e) AS edits, count(DISTINCT s) AS sessions ORDER BY path"""
 
 # Where each session's lines sit in each file now.

@@ -74,6 +74,7 @@ const state = {
   entries: [],
   sessions: new Map(),
   root: "",
+  scopeDir: null,
   tabs: [],
   expanded: new Set(),
   // The agent-only view starts with every folder open; these are the ones closed there.
@@ -421,17 +422,106 @@ function commonRoot(paths) {
   return n ? first.slice(0, n).join("/") + "/" : "";
 }
 
+// The top bar counts what the reader is looking at: a block picked from the
+// outline, the open file, a folder picked in the sidebar, or the whole project.
+// `state.scopeDir` is a folder the reader moved to ("" for the project); it
+// lasts until they open a file or pick a line.
+function summaryScope() {
+  const f = state.file;
+  if (state.scopeDir) return { kind: "dir", path: state.scopeDir };
+  if (state.scopeDir === "" || !f) return { kind: "project" };
+  if (f.lines && state.panel?.view === "span" && state.panel.path === f.path) return { kind: "block", span: state.panel.span };
+  return { kind: "file" };
+}
+
+// Current lines by kind between two line numbers, and the sessions that wrote them.
+function linesMix(tracks, start, end) {
+  const mix = { agent: 0, inferred: 0, total: 0, ids: new Set() };
+  for (let i = lowerBound(tracks.length, (k) => tracks[k].end < start); i < tracks.length && tracks[i].start <= end; i++) {
+    const range = tracks[i];
+    const n = Math.min(end, range.end) - Math.max(start, range.start) + 1;
+    mix.total += n;
+    if (range.kind === "agent") {
+      mix.agent += n;
+      for (const id of laneIds(range)) mix.ids.add(id);
+    } else if (range.kind === "inferred") mix.inferred += n;
+  }
+  return mix;
+}
+
+function dirMix(dir) {
+  const mix = { agent: 0, inferred: 0, total: 0, ids: new Set() };
+  for (const f of state.overview.files) {
+    if (!inRoot(f.path) || !rel(f.path).startsWith(dir)) continue;
+    mix.agent += f.agent_lines || 0;
+    mix.inferred += f.inferred_lines || 0;
+    mix.total += f.ranged_lines || 0;
+    for (const id of f.touched || []) mix.ids.add(id);
+  }
+  return mix;
+}
+
+const parentDir = (path) => path.replace(/[^/]+\/?$/, "");
+
 function renderSummary() {
-  const s = state.overview.stats;
-  const pct = s.agent_fraction == null ? null : Math.round(s.agent_fraction * 100);
-  const included = s.agent_plus_inferred_fraction;
+  if (!state.overview) return;
+  const scope = summaryScope();
+  const f = state.file;
+  let mix, label, name, tip, up;
+  if (scope.kind === "project") {
+    const s = state.overview.stats;
+    mix = { sessions: s.sessions, agent: s.agent_fraction, included: s.agent_plus_inferred_fraction };
+  } else {
+    let lines;
+    if (scope.kind === "block") {
+      const { line, end, name: block, kind } = scope.span;
+      lines = linesMix(f.tracks || [], line, end);
+      label = kind || "Block";
+      name = block;
+      tip = `Lines ${line}–${end} of ${base(f.path)}`;
+      up = () => selectLine(line);
+    } else if (scope.kind === "file") {
+      const n = f.lines?.length || 0;
+      lines = linesMix(f.tracks || [], 1, n);
+      for (const id of state.overview.files.find((row) => row.path === f.path)?.touched || []) lines.ids.add(id);
+      label = "File";
+      name = base(f.path);
+      tip = rel(f.path);
+      up = () => setScopeDir(inRoot(f.path) ? parentDir(rel(f.path)) : "");
+    } else {
+      lines = dirMix(scope.path);
+      label = "Folder";
+      name = scope.path;
+      tip = scope.path;
+      up = () => setScopeDir(parentDir(scope.path));
+    }
+    const share = (n) => (lines.total ? n / lines.total : null);
+    mix = { sessions: lines.ids.size, agent: share(lines.agent), included: lines.inferred ? share(lines.agent + lines.inferred) : null };
+  }
+  const pct = mix.agent == null ? null : Math.round(mix.agent * 100);
+  const where = scope.kind === "project" ? "current lines" : scope.kind === "dir" ? "current lines in this folder" : `current lines in this ${scope.kind}`;
   $("summary").replaceChildren(
-    stat("chat", s.sessions, "session", true),
+    up
+      ? h(
+          "button",
+          { type: "button", class: "scope", title: `${tip}\nClick to go up a level`, "aria-label": `${label} ${name}. Go up a level.`, onclick: up },
+          h("span", { class: "scope-kind" }, label),
+          h("span", { class: "scope-name" }, name),
+          icon("up"),
+        )
+      : "",
+    stat("chat", mix.sessions, "session", true),
     pct == null
       ? ""
-      : h("span", { class: "stat", title: `${pct}% of current lines were written by agents` }, h("span", { class: "share" }, h("i", { style: `width:${pct}%` })), `${pct}% agent-written`),
-    included == null ? "" : h("span", { class: "stat" }, `${Math.round(included * 100)}% including inferred`),
+      : h("span", { class: "stat", title: `${pct}% of ${where} were written by agents` }, h("span", { class: "share" }, h("i", { style: `width:${pct}%` })), `${pct}% agent-written`),
+    mix.included == null ? "" : h("span", { class: "stat" }, `${Math.round(mix.included * 100)}% including inferred`),
   );
+}
+
+function setScopeDir(dir) {
+  if (state.scopeDir === dir) return;
+  state.scopeDir = dir;
+  renderSummary();
 }
 
 // Every file the explorer can show: files in the open folder on disk, plus every
@@ -507,6 +597,7 @@ function toggleFolder(view, folder) {
   else set.add(path);
   setTreeFolder(view, folder, folderOpen(path));
   updateFoldButton();
+  setScopeDir(path);
 }
 
 function foldAll() {
@@ -1633,6 +1724,8 @@ async function openFile(path, line = null, { keepFocus = true, keepPanel = false
   if (request !== nav.fileRequest) return;
   const current = refresh ? whereNow() : null;
   state.file = file;
+  // A refresh of the open file keeps the folder the reader chose.
+  if (!refresh) state.scopeDir = null;
   if (!keepFocus) state.focus = null;
   addTab(file.path);
   ensureExpanded(file.path);
@@ -1716,6 +1809,7 @@ function closeTab(path) {
 
 function clearFile() {
   state.file = null;
+  state.scopeDir = null;
   state.line = null;
   resetFileView();
   nav.fileRequest++;
@@ -1734,6 +1828,7 @@ function clearFile() {
   $("find").hidden = true;
   paintSyntax();
   scanFind();
+  renderSummary();
   renderOutline();
   $("code-empty").hidden = false;
   $("code-empty").replaceChildren(...(state.overview ? ["Pick a file ", h("kbd", {}, `${MOD}P`), ", then click a line."] : []));
@@ -2031,6 +2126,7 @@ function renderFile() {
   mountFile(f);
   renderGapsToggle();
   renderOutline();
+  renderSummary();
 }
 
 // Share the idle scheduler with other whole-file scans. Each slice yields even
@@ -2341,6 +2437,7 @@ function selectGap(after, { open = false, scroll = false, panel } = {}) {
   if (!list) return;
   state.line = null;
   state.gap = after;
+  state.scopeDir = null;
   if (open && !isGapOpen(after)) toggleGap(after);
   markSelected();
   if (scroll) scrollToFileRow(after, true);
@@ -2448,6 +2545,7 @@ function selectLine(n, { scroll = false, span = null, panel } = {}) {
   n = Math.max(1, Math.min(state.file.lines.length, n));
   state.line = n;
   state.gap = null;
+  state.scopeDir = null;
   markSelected();
   if (scroll) scrollToFileRow(n - 1);
   if (!panel) {
@@ -2481,6 +2579,7 @@ function showIntro() {
 function showPanel(panel) {
   state.panel = { ...panel };
   state.trace = null;
+  renderSummary();
   if (panel.view === "conversation") return renderSession(panel);
   if (panel.view === "span" || panel.view === "trace") {
     setPanel(h("div", { class: "empty" }, "Loading history…"));
@@ -4348,7 +4447,7 @@ function closeMenu() {
 
 function resetWorkspace() {
   outlines.clear();
-  Object.assign(state, { overview: null, tree: null, entries: [], root: "", tabs: [], file: null, line: null, focus: null, cypher: [] });
+  Object.assign(state, { overview: null, tree: null, entries: [], root: "", scopeDir: null, tabs: [], file: null, line: null, focus: null, cypher: [] });
   state.sessions.clear();
   state.expanded.clear();
   state.folded.clear();

@@ -69,6 +69,9 @@ def test_inference_uses_latest_named_hint_between_observations(tmp_path):
         assert stats["edits"] == 1 and stats["lines"]["inferred"] == 1
         assert stats["agent_fraction"] == 0
         assert stats["agent_plus_inferred_fraction"] == 1 / 3
+        # The reader's top bar sums these per file for a folder scope.
+        (row,) = [f for f in q.overview()["files"] if f["path"] == path]
+        assert (row["agent_lines"], row["inferred_lines"], row["ranged_lines"]) == (0, 1, 3)
 
 
 def test_drift_uses_preceding_proven_edit_and_discards_old_hint(tmp_path):
