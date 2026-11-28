@@ -104,6 +104,11 @@ kbd { font: 12px var(--ui); color: var(--muted); border: 1px solid var(--rule); 
 .summary .stat { color: var(--ink); }
 .summary .word { color: var(--muted); }
 .summary .share { width: 40px; height: 4px; margin: 0 2px 0 0; }
+.summary .scope { display: inline-flex; align-items: center; gap: 6px; min-width: 0; max-width: 40%; padding: 2px 6px 2px 8px; border: 1px solid var(--rule); border-radius: 6px; background: none; color: var(--ink); font: inherit; cursor: pointer; }
+.summary .scope:hover { background: var(--hover); }
+.summary .scope-kind { color: var(--muted); text-transform: capitalize; }
+.summary .scope-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+.summary .scope svg { width: 14px; height: 14px; flex: none; color: var(--muted); }
 .tools { display: flex; align-items: center; gap: 8px; }
 
 /* File menu */
